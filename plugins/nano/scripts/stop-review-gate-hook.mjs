@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { getKimiAvailability } from "./lib/runtime.mjs";
+import { getClaudeAvailability, resolveApiKey } from "./lib/runtime.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
@@ -55,14 +55,21 @@ function buildStopReviewPrompt(input = {}) {
   });
 }
 
+// The gate is ready only when both `claude` is on PATH and a NanoGPT API key
+// resolves. It must never run a write-capable task, only `task --read-only`.
 function buildSetupNote(cwd) {
-  const availability = getKimiAvailability(cwd);
-  if (availability.available) {
-    return null;
+  const availability = getClaudeAvailability(cwd);
+  if (!availability.available) {
+    const detail = availability.detail ? ` ${availability.detail}.` : "";
+    return `NanoGPT is not set up for the review gate.${detail} Run /nano:setup.`;
   }
 
-  const detail = availability.detail ? ` ${availability.detail}.` : "";
-  return `Kimi is not set up for the review gate.${detail} Run /nano:setup.`;
+  const apiKey = resolveApiKey();
+  if (!apiKey.key) {
+    return "NanoGPT is not set up for the review gate. Run /nano:setup.";
+  }
+
+  return null;
 }
 
 function parseStopReviewOutput(rawOutput) {
@@ -71,7 +78,7 @@ function parseStopReviewOutput(rawOutput) {
     return {
       ok: false,
       reason:
-        "The stop-time Kimi review task returned no final output. Run /nano:review --wait manually or bypass the gate."
+        "The stop-time NanoGPT review task returned no final output. Run /nano:review --wait manually or bypass the gate."
     };
   }
 
@@ -83,14 +90,14 @@ function parseStopReviewOutput(rawOutput) {
     const reason = firstLine.slice("BLOCK:".length).trim() || text;
     return {
       ok: false,
-      reason: `Kimi stop-time review found issues that still need fixes before ending the session: ${reason}`
+      reason: `NanoGPT stop-time review found issues that still need fixes before ending the session: ${reason}`
     };
   }
 
   return {
     ok: false,
     reason:
-      "The stop-time Kimi review task returned an unexpected answer. Run /nano:review --wait manually or bypass the gate."
+      "The stop-time NanoGPT review task returned an unexpected answer. Run /nano:review --wait manually or bypass the gate."
   };
 }
 
@@ -101,7 +108,7 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--read-only", prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",
@@ -112,7 +119,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Kimi review task timed out after 15 minutes. Run /nano:review --wait manually or bypass the gate."
+        "The stop-time NanoGPT review task timed out after 15 minutes. Run /nano:review --wait manually or bypass the gate."
     };
   }
 
@@ -121,8 +128,8 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason: detail
-        ? `The stop-time Kimi review task failed: ${detail}`
-        : "The stop-time Kimi review task failed. Run /nano:review --wait manually or bypass the gate."
+        ? `The stop-time NanoGPT review task failed: ${detail}`
+        : "The stop-time NanoGPT review task failed. Run /nano:review --wait manually or bypass the gate."
     };
   }
 
@@ -133,7 +140,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Kimi review task returned invalid JSON. Run /nano:review --wait manually or bypass the gate."
+        "The stop-time NanoGPT review task returned invalid JSON. Run /nano:review --wait manually or bypass the gate."
     };
   }
 }
@@ -147,7 +154,7 @@ function main() {
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
   const runningTaskNote = runningJob
-    ? `Kimi task ${runningJob.id} is still running. Check /nano:status and use /nano:cancel ${runningJob.id} if you want to stop it before ending the session.`
+    ? `NanoGPT task ${runningJob.id} is still running. Check /nano:status and use /nano:cancel ${runningJob.id} if you want to stop it before ending the session.`
     : null;
 
   if (!config.stopReviewGate) {

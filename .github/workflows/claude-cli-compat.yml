@@ -1,13 +1,13 @@
-name: kimi-cli compat
+name: claude-cli compat
 
-# Verifies that the kimi-cli command surface this plugin depends on
-# (subcommands + flags parsed from `kimi --help`) still exists across recent
-# kimi-cli releases. If a kimi-cli version drops a command/flag we rely on,
-# the matching matrix job fails loudly in its own log.
+# Verifies that the Claude Code command surface this plugin depends on
+# (flags parsed from `claude --help`) still exists across recent Claude Code
+# releases. If a Claude Code version drops a flag we rely on, the matching
+# matrix job fails loudly in its own log.
 #
 # The offline contract test (tests/cli-contract.test.mjs) runs in the normal
 # CI workflow; this workflow exercises the SAME manifest against REAL installed
-# kimi-cli versions via plugins/nano/scripts/check-cli-contract.mjs.
+# Claude Code versions via plugins/nano/scripts/check-cli-contract.mjs.
 
 on:
   # Re-validate whenever the manifest or contract code changes.
@@ -15,9 +15,10 @@ on:
     paths:
       - "plugins/nano/scripts/lib/cli-contract.mjs"
       - "plugins/nano/scripts/check-cli-contract.mjs"
+      - "plugins/nano/scripts/lib/runtime.mjs"
       - "tests/cli-contract.test.mjs"
       - ".github/workflows/claude-cli-compat.yml"
-  # Catch upstream kimi-cli releases that break us.
+  # Catch upstream Claude Code releases that break us.
   schedule:
     - cron: "0 7 * * 1" # Mondays 07:00 UTC
   workflow_dispatch:
@@ -27,56 +28,46 @@ permissions:
 
 jobs:
   compat:
-    name: kimi-cli ${{ matrix.kimi-version }}
+    name: claude-cli ${{ matrix.claude-version }}
     runs-on: ubuntu-latest
-    # Non-blocking: kimi-cli is a third-party PyPI package and its install
-    # surface (Python version floor, package availability) can change without
-    # notice. We do NOT want an install hiccup in a third-party dependency to
-    # block PR merges. Real contract regressions still show up as a red job in
-    # this workflow's log and on the scheduled runs. Make this a required check
-    # only once the install path has proven stable.
+    # Non-blocking: @anthropic-ai/claude-code is a third-party npm package and
+    # its install surface (Node version floor, package availability, install
+    # name) can change without notice. We do NOT want an install hiccup in a
+    # third-party dependency to block PR merges. Real contract regressions
+    # still show up as a red job in this workflow's log and on the scheduled
+    # runs. Make this a required check only once the install path has proven
+    # stable.
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        # Recent kimi-cli releases on PyPI. Supported floor verified at 1.44.0:
-        # every command/flag the plugin uses (--version, info, login, --quiet,
-        # --yolo, --model, --thinking, --continue, -p) is present from 1.44.0
-        # through 1.47.0 (confirmed against a locally installed 1.44.0 and the
-        # 1.47.0 source). Add/trim versions as kimi-cli ships new releases; if a
-        # future older floor drops a flag, remove it from this list rather than
-        # leaving the job red.
-        kimi-version:
-          - "1.47.0"
-          - "1.46.0"
-          - "1.45.0"
-          - "1.44.0"
+        # Recent Claude Code releases on npm. The pinned floor is 2.1.278,
+        # which is the minimum version the plugin supports (every flag/value
+        # the plugin uses is present from 2.1.278). "latest" tracks the newest
+        # release. Add/trim versions as Claude Code ships new releases; if a
+        # future older floor drops a flag, remove it from this list rather
+        # than leaving the job red.
+        claude-version:
+          - "2.1.278"
+          - "latest"
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18.x"
+          node-version: "22.x"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          # kimi-cli requires Python >= 3.12 (per PyPI metadata).
-          python-version: "3.12"
-
-      # Install method: kimi-cli is published to PyPI as `kimi-cli`
-      # (https://pypi.org/project/kimi-cli/). Docs also document
-      # `uv tool install kimi-cli`. We pin the exact version under test.
+      # Install method: Claude Code is published to npm as
+      # @anthropic-ai/claude-code (https://www.npmjs.com/package/@anthropic-ai/claude-code).
+      # We pin the exact version under test (or "latest" to track new releases).
       # NOTE: if a future release changes the install surface (e.g. a new
-      # package name or a Python floor bump), adjust this step.
-      - name: Install kimi-cli ${{ matrix.kimi-version }}
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install "kimi-cli==${{ matrix.kimi-version }}"
+      # package name or a Node floor bump), adjust this step.
+      - name: Install @anthropic-ai/claude-code ${{ matrix.claude-version }}
+        run: npm install -g @anthropic-ai/claude-code@${{ matrix.claude-version }}
 
-      - name: Show installed kimi version
-        run: kimi --version || true
+      - name: Show installed claude version
+        run: claude --version || true
 
-      - name: Verify plugin command contract against installed kimi-cli
+      - name: Verify plugin command contract against installed Claude Code
         run: node plugins/nano/scripts/check-cli-contract.mjs

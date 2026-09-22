@@ -5,8 +5,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { buildEnv, installFakeKimi } from "./fake-claude-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { buildEnv, installFakeClaude, readInvocations } from "./fake-claude-fixture.mjs";
+import { initGitRepo, makeTempDir, run, writeExecutable } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "nano");
@@ -16,22 +16,32 @@ const LIFECYCLE_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook
 const STATE_MODULE = pathToFileURL(path.join(PLUGIN_ROOT, "scripts", "lib", "state.mjs")).href;
 const { setConfig, getConfig } = await import(STATE_MODULE);
 
+// Shadow the real macOS/Linux keychain lookups so a real NanoGPT key that
+// might be configured on the machine running these tests can never leak in
+// (see the matching helper/comment in tests/runtime.test.mjs).
+function blockSystemKeychain(binDir) {
+  const denyScript = "#!/usr/bin/env node\nprocess.exit(1);\n";
+  writeExecutable(path.join(binDir, "security"), denyScript);
+  writeExecutable(path.join(binDir, "secret-tool"), denyScript);
+}
+
 /**
- * Spins up an isolated runtime. When `installKimi` is false, the fake `kimi`
- * is omitted AND the host PATH is stripped to just the empty bin dir, so the
- * companion cannot discover any real kimi on the host.
+ * Spins up an isolated runtime. When `installClaude` is false, the fake
+ * `claude` is omitted AND the host PATH is stripped to just the empty bin
+ * dir, so the companion cannot discover any real claude on the host.
  */
-function setupRuntime({ behavior = "ok", installKimi = true } = {}) {
-  const binDir = makeTempDir("kimi-bin-");
-  const dataDir = makeTempDir("kimi-data-");
-  const repoDir = fs.realpathSync.native(makeTempDir("kimi-repo-"));
+function setupRuntime({ behavior = "ok", installClaude = true, apiKey = true } = {}) {
+  const binDir = makeTempDir("claude-bin-");
+  const dataDir = makeTempDir("claude-data-");
+  const repoDir = fs.realpathSync.native(makeTempDir("claude-repo-"));
   initGitRepo(repoDir);
-  if (installKimi) {
-    installFakeKimi(binDir, behavior);
+  if (installClaude) {
+    installFakeClaude(binDir, behavior);
   }
-  const env = buildEnv(binDir, dataDir);
-  if (!installKimi) {
-    // Strip the inherited PATH so a host-installed kimi cannot be resolved.
+  blockSystemKeychain(binDir);
+  const env = buildEnv(binDir, dataDir, apiKey ? {} : { NANOGPT_API_KEY: undefined });
+  if (!installClaude) {
+    // Strip the inherited PATH so a host-installed claude cannot be resolved.
     env.PATH = binDir;
   }
   return { binDir, dataDir, repoDir, env };
@@ -61,8 +71,8 @@ function enableGate(rt) {
 }
 
 function runStopHook(rt, input, options = {}) {
-  // Invoke node via its absolute path so tests that strip PATH (to hide kimi)
-  // can still launch the hook itself.
+  // Invoke node via its absolute path so tests that strip PATH (to hide
+  // claude) can still launch the hook itself.
   return run(process.execPath, [STOP_HOOK], {
     cwd: options.cwd ?? rt.repoDir,
     env: rt.env,
@@ -101,10 +111,10 @@ test("Stop hook with a fresh (default) config does not trigger a review", () => 
   assert.equal(result.stdout.trim(), "");
 });
 
-// --- enabled gate, kimi unavailable: graceful no-block ----------------------
+// --- enabled gate, claude/key unavailable: graceful no-block ----------------
 
-test("Stop hook with gate enabled but kimi unavailable does not block", () => {
-  const rt = setupRuntime({ installKimi: false });
+test("Stop hook with gate enabled but claude unavailable does not block", () => {
+  const rt = setupRuntime({ installClaude: false });
   enableGate(rt);
 
   const result = runStopHook(rt, { cwd: rt.repoDir, last_assistant_message: "edited a file" });
@@ -112,14 +122,25 @@ test("Stop hook with gate enabled but kimi unavailable does not block", () => {
   assert.equal(result.status, 0, result.stderr);
   // No block decision: the gate degrades to a stderr setup note.
   assert.equal(result.stdout.trim(), "");
-  assert.match(result.stderr, /Kimi is not set up for the review gate/);
+  assert.match(result.stderr, /NanoGPT is not set up for the review gate/);
   assert.match(result.stderr, /\/nano:setup/);
 });
 
-// --- enabled gate, kimi available: review runs and parses output ------------
+test("Stop hook with gate enabled but no API key does not block", () => {
+  const rt = setupRuntime({ apiKey: false });
+  enableGate(rt);
+
+  const result = runStopHook(rt, { cwd: rt.repoDir, last_assistant_message: "edited a file" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "");
+  assert.match(result.stderr, /NanoGPT is not set up for the review gate/);
+});
+
+// --- enabled gate, claude available: review runs read-only and parses output ---
 
 test("Stop hook with gate enabled blocks when the review returns a non-ALLOW answer", () => {
-  // The fake kimi prints a canned message that does not start with ALLOW:,
+  // The fake claude prints a canned message that does not start with ALLOW:,
   // so the parser treats it as an unexpected answer and blocks.
   const rt = setupRuntime({ behavior: "ok" });
   enableGate(rt);
@@ -130,6 +151,36 @@ test("Stop hook with gate enabled blocks when the review returns a non-ALLOW ans
   const decision = JSON.parse(result.stdout.trim());
   assert.equal(decision.decision, "block");
   assert.match(decision.reason, /unexpected answer/);
+});
+
+test("Stop hook runs the review task with the read-only tool profile", () => {
+  const rt = setupRuntime({ behavior: "ok" });
+  enableGate(rt);
+
+  const result = runStopHook(rt, { cwd: rt.repoDir, last_assistant_message: "edited a file" });
+  assert.equal(result.status, 0, result.stderr);
+
+  const invocationsLog = path.join(rt.binDir, "claude-invocations.log");
+  const invocations = readInvocations(invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].tools, "Read,Glob,Grep");
+  assert.equal(invocations[0].allowedTools, "Read,Glob,Grep");
+});
+
+test("Stop hook allows the session to stop when the review answers ALLOW", () => {
+  const binDir = makeTempDir("claude-bin-");
+  const dataDir = makeTempDir("claude-data-");
+  const repoDir = fs.realpathSync.native(makeTempDir("claude-repo-"));
+  initGitRepo(repoDir);
+  installFakeClaude(binDir, "ok", { resultText: "ALLOW: nothing to flag" });
+  blockSystemKeychain(binDir);
+  const rt = { binDir, dataDir, repoDir, env: buildEnv(binDir, dataDir) };
+  enableGate(rt);
+
+  const result = runStopHook(rt, { cwd: rt.repoDir, last_assistant_message: "edited a file" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "");
 });
 
 // --- session lifecycle hook -------------------------------------------------

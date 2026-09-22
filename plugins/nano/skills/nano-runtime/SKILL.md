@@ -25,6 +25,7 @@ Command selection:
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
 - If the forwarded request includes `--model`, pass it through to `task`.
 - If the forwarded request includes `--thinking`, pass it through to `task`.
+- If the forwarded request includes `--read-only`, `--allow-bash <prefix>` (repeatable), or `--allow-paid`, pass each through to `task` as its own flag and strip it from the task text.
 - If the forwarded request includes `--continue`, strip that token from the task text and add `--continue`.
 - `--continue`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
 

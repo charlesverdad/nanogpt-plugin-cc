@@ -106,7 +106,7 @@ function inferLegacyJobPhase(job, progressPreview = []) {
 
   for (let index = progressPreview.length - 1; index >= 0; index -= 1) {
     const line = progressPreview[index].toLowerCase();
-    if (line.startsWith("starting kimi") || line.startsWith("kimi process started")) {
+    if (line.startsWith("starting nanogpt") || line.startsWith("nanogpt process started")) {
       return "starting";
     }
     if (line.includes("review")) {
@@ -238,7 +238,7 @@ export function resolveResultJob(cwd, reference) {
     throw new Error(`No finished job found for "${reference}". Run /nano:status to inspect active jobs.`);
   }
 
-  throw new Error("No finished Kimi jobs found for this repository yet.");
+  throw new Error("No finished NanoGPT jobs found for this repository yet.");
 }
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
@@ -260,12 +260,12 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
     return { workspaceRoot, job: sessionScopedActiveJobs[0] };
   }
   if (sessionScopedActiveJobs.length > 1) {
-    throw new Error("Multiple Kimi jobs are active. Pass a job id to /nano:cancel.");
+    throw new Error("Multiple NanoGPT jobs are active. Pass a job id to /nano:cancel.");
   }
 
   if (getCurrentSessionId(options)) {
-    throw new Error("No active Kimi jobs to cancel for this session.");
+    throw new Error("No active NanoGPT jobs to cancel for this session.");
   }
 
-  throw new Error("No active Kimi jobs to cancel.");
+  throw new Error("No active NanoGPT jobs to cancel.");
 }

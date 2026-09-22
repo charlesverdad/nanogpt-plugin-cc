@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the NanoGPT rescue subagent
-argument-hint: "[--background|--wait] [--continue] [--model <model>] [--thinking] [what NanoGPT should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [what NanoGPT should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -19,6 +19,7 @@ Execution mode:
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to the subagent, and do not treat them as part of the natural-language task text.
 - `--model` is a runtime-selection flag. Preserve it for the forwarded request, but do not treat it as part of the natural-language task text.
 - `--thinking` is a runtime-selection flag. Preserve it for the forwarded request, but do not treat it as part of the natural-language task text.
+- `--read-only`, `--allow-bash <prefix>` (repeatable), and `--allow-paid` are runtime-selection flags. Preserve them for the forwarded request, but do not treat them as part of the natural-language task text.
 - If the request includes `--continue`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting NanoGPT, check for a resumable task from this Claude session by running:
 
@@ -44,5 +45,6 @@ Operating rules:
 - Do not ask the subagent to inspect files, monitor progress, poll `/nano:status`, fetch `/nano:result`, call `/nano:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--thinking` unset unless the user explicitly asks for it.
 - Leave the model unset unless the user explicitly asks for one.
+- Leave `--read-only`, `--allow-bash`, and `--allow-paid` unset unless the user explicitly asks for them.
 - If the helper reports that NanoGPT is missing or unauthenticated, stop and tell the user to run `/nano:setup`.
 - If the user did not supply a request, ask what NanoGPT should investigate or fix.

@@ -25,7 +25,8 @@ Forwarding rules:
 - Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`. This subagent only forwards to `task`.
 - Leave `--thinking` unset unless the user explicitly requests it.
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
-- Treat `--model <value>` and `--thinking` as runtime controls and do not include them in the task text you pass through.
+- Leave `--read-only`, `--allow-bash <prefix>`, and `--allow-paid` unset unless the user explicitly requests them.
+- Treat `--model <value>`, `--thinking`, `--read-only`, `--allow-bash <prefix>` (repeatable), and `--allow-paid` as runtime controls: strip them from the task text you pass through, but forward each one you received as its own flag on the `task` command.
 - Treat `--continue` as a routing control and do not include it in the task text you pass through.
 - `--continue` means add `--continue` to the command.
 - If the user is clearly asking to continue prior NanoGPT work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--continue` unless `--fresh` is present.

@@ -84,8 +84,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    const jobPatch = execution.jobPatch && typeof execution.jobPatch === "object" ? execution.jobPatch : {};
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
+      ...jobPatch,
       status: completionStatus,
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
@@ -95,6 +97,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     });
     upsertJob(job.workspaceRoot, {
       id: job.id,
+      ...jobPatch,
       status: completionStatus,
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : "failed",

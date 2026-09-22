@@ -1,6 +1,7 @@
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
+  const multiValueOptions = new Set(config.multiValueOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
   const options = {};
   const positionals = [];
@@ -45,6 +46,21 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
+      if (multiValueOptions.has(key)) {
+        const nextValue = inlineValue ?? argv[index + 1];
+        if (nextValue === undefined) {
+          throw new Error(`Missing value for --${rawKey}`);
+        }
+        if (!Array.isArray(options[key])) {
+          options[key] = [];
+        }
+        options[key].push(nextValue);
+        if (inlineValue === undefined) {
+          index += 1;
+        }
+        continue;
+      }
+
       positionals.push(token);
       continue;
     }
@@ -63,6 +79,19 @@ export function parseArgs(argv, config = {}) {
         throw new Error(`Missing value for -${shortKey}`);
       }
       options[key] = nextValue;
+      index += 1;
+      continue;
+    }
+
+    if (multiValueOptions.has(key)) {
+      const nextValue = argv[index + 1];
+      if (nextValue === undefined) {
+        throw new Error(`Missing value for -${shortKey}`);
+      }
+      if (!Array.isArray(options[key])) {
+        options[key] = [];
+      }
+      options[key].push(nextValue);
       index += 1;
       continue;
     }
