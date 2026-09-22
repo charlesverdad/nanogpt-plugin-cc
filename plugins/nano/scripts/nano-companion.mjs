@@ -1,12 +1,26 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
+import {
+  pingNanoGpt,
+  fetchSubscriptionUsage,
+  describeSubscription
+} from "./lib/account.mjs";
+import {
+  loadModelCatalog,
+  resolveModelSelection,
+  describeAliases,
+  DEFAULT_MODEL
+} from "./lib/models.mjs";
+import { verifyContract, HELP_ENV, REQUIRED_COMMANDS } from "./lib/cli-contract.mjs";
+import { runCommand } from "./lib/process.mjs";
 import {
   collectReviewContext,
   ensureGitRepository,
@@ -26,10 +40,12 @@ import {
   buildClaudeArgs,
   buildPermissionProfile,
   buildRunLogEntry,
+  compareVersions,
   DEFAULT_BASH_ALLOW,
   getClaudeAvailability,
   isToolUseProgressLine,
   KEY_SETUP_COMMAND,
+  MIN_CLAUDE_VERSION,
   normalizeBashAllow,
   parseClaudeJsonOutput,
   parseStreamEvent,
@@ -65,6 +81,7 @@ import {
   renderCancelReport,
   renderJobStatusReport,
   renderReviewResult,
+  renderRunFooter,
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult,
@@ -76,23 +93,37 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 
-// Model resolution seam. This step ignores `thinking`/`allowPaid`; step 5
-// replaces the body with a catalog-backed lookup (lib/models.mjs) but keeps
-// this same async signature so callers do not need to change.
-const DEFAULT_MODEL = "z-ai/glm-5.2";
+// Emits each selection warning to stderr (so it surfaces interactively) and
+// returns the resolved model id plus the warnings, so callers can attach them
+// to task/review payloads and rendered output.
+function emitWarnings(warnings) {
+  for (const text of warnings) {
+    process.stderr.write(`[nano] warning: ${text}\n`);
+  }
+}
 
-async function resolveRunModel({ requested, config, thinking, allowPaid } = {}) {
-  void thinking;
-  void allowPaid;
-  const trimmedRequested = requested ? String(requested).trim() : "";
-  if (trimmedRequested) {
-    return trimmedRequested;
-  }
-  const configModel = config?.model ? String(config.model).trim() : "";
-  if (configModel) {
-    return configModel;
-  }
-  return DEFAULT_MODEL;
+/**
+ * Resolve a run model against the NanoGPT catalog. With no API key the builtin
+ * catalog is used (offline). A thrown selection error (paid/unknown model)
+ * propagates to the caller, which fails the command with exit 1.
+ *
+ * Returns `{ model, warnings }`. Callers are responsible for calling
+ * emitWarnings and attaching warnings to the payload.
+ */
+async function resolveRunModel({ requested, config, thinking = false, allowPaid = false } = {}) {
+  const { key: apiKey } = resolveApiKey();
+  const catalog = await loadModelCatalog({
+    apiKey,
+    baseUrl: resolveBaseUrl(),
+    env: process.env
+  });
+  return resolveModelSelection({
+    requested,
+    configModel: config?.model,
+    thinking,
+    allowPaid,
+    catalog
+  });
 }
 
 function printUsage() {
@@ -185,36 +216,232 @@ function ensureClaudeAvailable(cwd) {
   }
 }
 
+// Force plain, wide help output so commander doesn't wrap/colorize, mirroring
+// check-cli-contract.mjs.
+const SETUP_HELP_ENV = { ...process.env, ...HELP_ENV };
+
+function fetchHelpForContract(argv) {
+  const result = runCommand("claude", argv, {
+    maxBuffer: 10 * 1024 * 1024,
+    env: SETUP_HELP_ENV
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  return `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+}
+
+/**
+ * Detect a project test command for the setup next-steps suggestion
+ * (HANDOVER §10). Returns `{ command, prefix }` where `command` is the full
+ * suggested `/nano:setup --allow-bash ...` / `just test` / `cargo test` and
+ * `prefix` is the Bash allowlist prefix it would add (so callers can skip the
+ * suggestion when the prefix is already allowlisted), or null.
+ */
+function detectTestCommandSuggestion(workspaceRoot, effectiveBashAllow) {
+  const hasPackageJson = fs.existsSync(path.join(workspaceRoot, "package.json"));
+  if (hasPackageJson) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(workspaceRoot, "package.json"), "utf8"));
+      if (pkg && typeof pkg.scripts === "object" && typeof pkg.scripts.test === "string") {
+        if (effectiveBashAllow.includes("npm test")) {
+          return null;
+        }
+        return { command: '/nano:setup --allow-bash "npm test"', prefix: "npm test" };
+      }
+    } catch {
+      // malformed package.json: fall through
+    }
+  }
+
+  for (const name of ["justfile", "Justfile"]) {
+    const file = path.join(workspaceRoot, name);
+    if (fs.existsSync(file)) {
+      try {
+        const text = fs.readFileSync(file, "utf8");
+        if (/^\s*test\b/m.test(text)) {
+          if (effectiveBashAllow.includes("just test")) {
+            return null;
+          }
+          return { command: "just test", prefix: "just test" };
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  if (fs.existsSync(path.join(workspaceRoot, "Cargo.toml"))) {
+    if (effectiveBashAllow.includes("cargo test")) {
+      return null;
+    }
+    return { command: "cargo test", prefix: "cargo test" };
+  }
+
+  return null;
+}
+
 async function buildSetupReport(cwd, actionsTaken = []) {
-  const claudeAvailability = getClaudeAvailability(cwd);
-  const version = claudeAvailability.available ? parseClaudeVersion(claudeAvailability.detail) : null;
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
   const reviewGateEnabled = Boolean(config.stopReviewGate);
-  const apiKey = resolveApiKey();
+  const { key: apiKey, source: apiKeySource } = resolveApiKey();
+  const baseUrl = resolveBaseUrl();
 
-  const nextSteps = [];
+  const claudeAvailability = getClaudeAvailability(cwd);
+  const claudeVersion = claudeAvailability.available ? parseClaudeVersion(claudeAvailability.detail) : null;
+
+  // Check 1: node version
+  const nodeOk = compareVersions(process.versions.node, "18.18.0") >= 0;
+  const nodeCheck = {
+    id: "node",
+    label: "Node",
+    ok: nodeOk,
+    detail: `Node ${process.versions.node}`
+  };
+
+  // Check 2: claude on PATH and version >= MIN_CLAUDE_VERSION
+  let claudeCheckOk = false;
+  let claudeCheckDetail;
   if (!claudeAvailability.available) {
-    nextSteps.push("Install Claude Code (https://claude.com/claude-code), then rerun `/nano:setup`.");
+    claudeCheckDetail = "not found";
+  } else if (!claudeVersion) {
+    claudeCheckDetail = `unparseable version: ${claudeAvailability.detail}`;
+  } else if (compareVersions(claudeVersion, MIN_CLAUDE_VERSION) < 0) {
+    claudeCheckDetail = `claude ${claudeVersion} is older than the required ${MIN_CLAUDE_VERSION}`;
+  } else {
+    claudeCheckOk = true;
+    claudeCheckDetail = `claude ${claudeVersion}`;
   }
-  if (!apiKey.key) {
-    nextSteps.push(KEY_SETUP_COMMAND);
+  const claudeCheck = {
+    id: "claude",
+    label: "Claude Code",
+    ok: claudeCheckOk,
+    detail: claudeCheckDetail
+  };
+
+  // Check 3: CLI contract (only when claude is present)
+  let contractOk = false;
+  let contractDetail;
+  if (!claudeAvailability.available) {
+    contractDetail = "skipped: claude not found";
+  } else {
+    try {
+      const verification = verifyContract(fetchHelpForContract, { manifest: REQUIRED_COMMANDS });
+      contractOk = verification.ok;
+      if (verification.ok) {
+        contractDetail = "CLI contract satisfied";
+      } else {
+        const missing = verification.missing.map((m) => m.token).join(", ");
+        contractDetail = `missing: ${missing}`;
+      }
+    } catch (error) {
+      contractDetail = `contract check failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
-  if (claudeAvailability.available && apiKey.key && !reviewGateEnabled) {
+  const contractCheck = {
+    id: "contract",
+    label: "CLI contract",
+    ok: contractOk,
+    detail: contractDetail
+  };
+
+  // Check 4: API key resolves (report the SOURCE only, never the value)
+  const apiKeyOk = Boolean(apiKey);
+  const apiKeyCheck = {
+    id: "apiKey",
+    label: "API key",
+    ok: apiKeyOk,
+    detail: apiKeyOk ? apiKeySource : "not found"
+  };
+
+  const pingModel = config.model || DEFAULT_MODEL;
+
+  // Check 5: pingNanoGpt (only when a key resolves)
+  let pingOk = false;
+  let pingDetail;
+  if (!apiKey) {
+    pingDetail = "skipped: no API key";
+  } else {
+    const ping = await pingNanoGpt({ apiKey, baseUrl, model: pingModel });
+    pingOk = ping.ok;
+    pingDetail = `${pingModel}: ${ping.detail}`;
+  }
+  const pingCheck = {
+    id: "ping",
+    label: "NanoGPT ping",
+    ok: pingOk,
+    detail: pingDetail
+  };
+
+  // Check 6: subscription active with remaining quota
+  let subscriptionOk = false;
+  let subscriptionDetail;
+  if (!apiKey) {
+    subscriptionDetail = "skipped: no API key";
+  } else {
+    const usage = await fetchSubscriptionUsage({ apiKey, baseUrl });
+    if (!usage.ok) {
+      subscriptionOk = false;
+      subscriptionDetail = describeSubscription(usage);
+    } else if (usage.active !== true) {
+      subscriptionOk = false;
+      subscriptionDetail = describeSubscription(usage);
+    } else if (usage.weeklyRemaining !== null && usage.weeklyRemaining <= 0) {
+      subscriptionOk = false;
+      subscriptionDetail = describeSubscription(usage);
+    } else {
+      subscriptionOk = true;
+      subscriptionDetail = describeSubscription(usage);
+    }
+  }
+  const subscriptionCheck = {
+    id: "subscription",
+    label: "Subscription",
+    ok: subscriptionOk,
+    detail: subscriptionDetail
+  };
+
+  const checks = [nodeCheck, claudeCheck, contractCheck, apiKeyCheck, pingCheck, subscriptionCheck];
+  const ready = checks.every((check) => check.ok);
+
+  // Load the catalog so we can report its source. With no key the builtin
+  // catalog is used (offline). The catalog fetch fails fast against the
+  // unreachable test base URL; nothing waits on a long timeout.
+  const catalog = await loadModelCatalog({ apiKey, baseUrl, env: process.env });
+
+  const defaultModel = config.model || DEFAULT_MODEL;
+  const aliases = describeAliases();
+  const bashAllow = normalizeBashAllow([...DEFAULT_BASH_ALLOW, ...(config.bashAllow ?? [])]);
+
+  // Build next-steps.
+  const nextSteps = [];
+  if (!claudeAvailability.available || (claudeVersion && compareVersions(claudeVersion, MIN_CLAUDE_VERSION) < 0)) {
+    nextSteps.push(`Install or upgrade Claude Code to >= ${MIN_CLAUDE_VERSION} (https://claude.com/claude-code), then rerun /nano:setup.`);
+  }
+  if (!apiKey) {
+    // Exactly the keychain command; it prompts for the key so it never lands
+    // in shell history. Never suggest .env files or plaintext config.
+    nextSteps.push(`${KEY_SETUP_COMMAND} (prompts for the key so it never lands in shell history)`);
+  }
+  if (apiKey && (!pingOk || !subscriptionOk)) {
+    nextSteps.push("Check the NanoGPT subscription and API key, then rerun /nano:setup.");
+  }
+  const testSuggestion = detectTestCommandSuggestion(workspaceRoot, bashAllow);
+  if (testSuggestion) {
+    nextSteps.push(`Allow the project test command: ${testSuggestion.command}`);
+  }
+  if (apiKey && claudeAvailability.available && !reviewGateEnabled) {
     nextSteps.push("Optional: run `/nano:setup --enable-review-gate` to require a fresh review before stop.");
   }
 
   return {
-    ready: claudeAvailability.available && Boolean(apiKey.key),
-    claude: {
-      available: claudeAvailability.available,
-      detail: claudeAvailability.detail,
-      version
-    },
-    apiKey: {
-      present: Boolean(apiKey.key),
-      source: apiKey.source
-    },
+    ready,
+    checks,
+    defaultModel,
+    aliases,
+    bashAllow,
+    catalogSource: catalog.source,
     reviewGateEnabled,
     actionsTaken,
     nextSteps
@@ -223,7 +450,8 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "model"],
+    multiValueOptions: ["allow-bash", "disallow-bash"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
 
@@ -233,6 +461,7 @@ async function handleSetup(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const config = getConfig(workspaceRoot);
   const actionsTaken = [];
 
   if (options["enable-review-gate"]) {
@@ -241,6 +470,58 @@ async function handleSetup(argv) {
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+
+  // --model: validate against the catalog (allowPaid false, thinking false)
+  // and store the resolved id.
+  if (options.model) {
+    const { key: modelApiKey } = resolveApiKey();
+    const modelCatalog = await loadModelCatalog({
+      apiKey: modelApiKey,
+      baseUrl: resolveBaseUrl(),
+      env: process.env
+    });
+    // Throws on paid/unknown model; the companion's top-level catch turns
+    // that into exit 1 with the message.
+    const { model: resolvedModel } = resolveModelSelection({
+      requested: options.model,
+      configModel: config.model,
+      thinking: false,
+      allowPaid: false,
+      catalog: modelCatalog
+    });
+    setConfig(workspaceRoot, "model", resolvedModel);
+    actionsTaken.push(`Set default model to ${resolvedModel}.`);
+  }
+
+  // --allow-bash <prefix> (repeatable): merge into config.bashAllow.
+  if (options["allow-bash"]) {
+    const newPrefixes = options["allow-bash"];
+    const merged = normalizeBashAllow([...(config.bashAllow ?? []), ...newPrefixes]);
+    setConfig(workspaceRoot, "bashAllow", merged);
+    for (const prefix of newPrefixes) {
+      actionsTaken.push(`Allowed Bash prefix: ${prefix}`);
+    }
+  }
+
+  // --disallow-bash <prefix> (repeatable): remove from config.bashAllow.
+  if (options["disallow-bash"]) {
+    const currentConfig = getConfig(workspaceRoot);
+    const currentList = Array.isArray(currentConfig.bashAllow) ? currentConfig.bashAllow : [];
+    for (const rawPrefix of options["disallow-bash"]) {
+      const [normalized] = normalizeBashAllow([rawPrefix]);
+      const prefix = normalized ?? String(rawPrefix).trim();
+      if (DEFAULT_BASH_ALLOW.includes(prefix)) {
+        actionsTaken.push(`Bash prefix "${prefix}" is a built-in default and cannot be removed (it stays).`);
+        continue;
+      }
+      if (!currentList.includes(prefix)) {
+        actionsTaken.push(`Bash prefix "${prefix}" was not present in the allowlist.`);
+        continue;
+      }
+      setConfig(workspaceRoot, "bashAllow", currentList.filter((p) => p !== prefix));
+      actionsTaken.push(`Removed Bash prefix: ${prefix}`);
+    }
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
@@ -401,13 +682,15 @@ async function executeReviewRun(request) {
     onProgress: request.onProgress
   });
 
+  const warnings = Array.isArray(request.warnings) ? request.warnings : [];
   const rendered = renderReviewResult({
     reviewLabel: reviewName,
     targetLabel: context.target.label,
     summary: run.summary,
     model: run.model,
     stdout: run.stdout,
-    stderr: run.stderr
+    stderr: run.stderr,
+    warnings
   });
 
   const payload = {
@@ -422,7 +705,9 @@ async function executeReviewRun(request) {
     permissionDenials: run.summary?.permissionDenials ?? [],
     numTurns: run.summary?.numTurns ?? null,
     durationMs: run.summary?.durationMs ?? null,
-    stderr: run.stderr
+    stderr: run.stderr,
+    warnings,
+    footer: renderRunFooter({ model: run.model, summary: run.summary })
   };
 
   return {
@@ -459,13 +744,15 @@ async function executeTaskRun(request) {
     onSession: request.onSession
   });
 
+  const warnings = Array.isArray(request.warnings) ? request.warnings : [];
   const { rendered, footer } = renderTaskRun({
     summary: run.summary,
     model: run.model,
     jobId: request.jobId ?? null,
     maxChars: resolveMaxInlineChars(),
     stdout: run.stdout,
-    stderr: run.stderr
+    stderr: run.stderr,
+    warnings
   });
 
   const payload = {
@@ -481,6 +768,7 @@ async function executeTaskRun(request) {
     numTurns: run.summary?.numTurns ?? null,
     durationMs: run.summary?.durationMs ?? null,
     stderr: run.stderr,
+    warnings,
     footer
   };
 
@@ -570,7 +858,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId }) {
+function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId, warnings }) {
   return {
     cwd,
     model,
@@ -578,7 +866,8 @@ function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessio
     profile,
     bashAllow,
     resumeSessionId,
-    jobId
+    jobId,
+    warnings: Array.isArray(warnings) ? warnings : []
   };
 }
 
@@ -669,7 +958,8 @@ async function handleReviewCommand(argv, config) {
     summary: metadata.summary
   });
 
-  const model = await resolveRunModel({ requested: options.model, config: workspaceConfig });
+  const { model, warnings } = await resolveRunModel({ requested: options.model, config: workspaceConfig });
+  emitWarnings(warnings);
 
   await runForegroundCommand(
     job,
@@ -681,6 +971,7 @@ async function handleReviewCommand(argv, config) {
         model,
         focusText,
         reviewName: config.reviewName,
+        warnings,
         onProgress: progress
       }),
     { json: options.json }
@@ -790,14 +1081,15 @@ async function handleTask(argv) {
   ]);
 
   const requestedModel = options.model ? String(options.model).trim() : carriedModel;
-  const model = await resolveRunModel({ requested: requestedModel, config, thinking, allowPaid });
+  const { model, warnings } = await resolveRunModel({ requested: requestedModel, config, thinking, allowPaid });
+  emitWarnings(warnings);
 
   const taskMetadata = buildTaskRunMetadata({ prompt, continueSession });
 
   if (options.background) {
     ensureClaudeAvailable(cwd);
     const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write");
-    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id });
+    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id, warnings });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
@@ -815,6 +1107,7 @@ async function handleTask(argv) {
         bashAllow,
         resumeSessionId,
         jobId: job.id,
+        warnings,
         onProgress: progress
       }),
     { json: options.json }

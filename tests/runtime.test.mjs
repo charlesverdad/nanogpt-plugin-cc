@@ -139,17 +139,24 @@ test("setup --json reports ready when claude is available and the API key resolv
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
-  assert.equal(payload.ready, true);
-  assert.equal(payload.claude.available, true);
-  assert.equal(payload.apiKey.present, true);
-  assert.match(payload.apiKey.source, /NANOGPT_API_KEY/);
+  assert.equal(payload.ready, false, "ready should be false without a reachable ping/subscription");
+  assert.equal(payload.defaultModel, "z-ai/glm-5.2");
+  assert.equal(payload.catalogSource, "builtin");
   assert.equal(payload.reviewGateEnabled, false);
-  assert.deepEqual(payload.nextSteps, [
-    "Optional: run `/nano:setup --enable-review-gate` to require a fresh review before stop."
-  ]);
+  // checks have the new { id, label, ok, detail } shape
+  const ids = payload.checks.map((c) => c.id);
+  assert.deepEqual(ids, ["node", "claude", "contract", "apiKey", "ping", "subscription"]);
+  const apiKeyCheck = payload.checks.find((c) => c.id === "apiKey");
+  assert.equal(apiKeyCheck.ok, true);
+  assert.match(apiKeyCheck.detail, /NANOGPT_API_KEY/);
+  // ping/subscription fail against the unreachable test base url
+  const pingCheck = payload.checks.find((c) => c.id === "ping");
+  assert.equal(pingCheck.ok, false);
+  const subCheck = payload.checks.find((c) => c.id === "subscription");
+  assert.equal(subCheck.ok, false);
 });
 
-test("setup --json reports not ready and the exact keychain command when the API key is missing", () => {
+test("setup --json reports not ready and the keychain command when the API key is missing", () => {
   const rt = setupRuntime("ok");
   blockSystemKeychain(rt.binDir);
   const env = buildEnv(rt.binDir, rt.dataDir, { NANOGPT_API_KEY: undefined });
@@ -159,10 +166,16 @@ test("setup --json reports not ready and the exact keychain command when the API
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ready, false);
-  assert.equal(payload.claude.available, true);
-  assert.equal(payload.apiKey.present, false);
-  assert.equal(payload.apiKey.source, null);
-  assert.deepEqual(payload.nextSteps, [KEY_SETUP_COMMAND]);
+  const apiKeyCheck = payload.checks.find((c) => c.id === "apiKey");
+  assert.equal(apiKeyCheck.ok, false);
+  assert.equal(apiKeyCheck.detail, "not found");
+  const pingCheck = payload.checks.find((c) => c.id === "ping");
+  assert.equal(pingCheck.detail, "skipped: no API key");
+  const subCheck = payload.checks.find((c) => c.id === "subscription");
+  assert.equal(subCheck.detail, "skipped: no API key");
+  const keyStep = payload.nextSteps.find((s) => s.startsWith(KEY_SETUP_COMMAND));
+  assert.ok(keyStep, "nextSteps contains the keychain command");
+  assert.equal(payload.nextSteps.some((s) => s.includes(".env")), false);
 });
 
 test("setup (human render) reports needs attention without claude on PATH", () => {
@@ -182,7 +195,7 @@ test("setup (human render) reports needs attention without claude on PATH", () =
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Status: needs attention/);
-  assert.match(result.stdout, /- claude: /);
+  assert.match(result.stdout, /- \[!!\] Claude Code:/);
 });
 
 // --- review ------------------------------------------------------------------
@@ -443,6 +456,7 @@ test("task --json payload has the documented shape", () => {
       "numTurns",
       "durationMs",
       "stderr",
+      "warnings",
       "footer"
     ])
   );
