@@ -1,5 +1,6 @@
 import fs from "node:fs";
 
+import { isToolUseProgressLine } from "./runtime.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -104,19 +105,15 @@ function inferLegacyJobPhase(job, progressPreview = []) {
       break;
   }
 
+  // For job records written before `phase` was stored, derive it from the
+  // stream-json progress lines in the job log.
   for (let index = progressPreview.length - 1; index >= 0; index -= 1) {
-    const line = progressPreview[index].toLowerCase();
-    if (line.startsWith("starting nanogpt") || line.startsWith("nanogpt process started")) {
+    const line = progressPreview[index];
+    if (line.startsWith("NanoGPT session ") && line.includes(" started")) {
       return "starting";
     }
-    if (line.includes("review")) {
-      return "reviewing";
-    }
-    if (line.startsWith("running command:") || line.startsWith("executing:")) {
+    if (isToolUseProgressLine(line)) {
       return "running";
-    }
-    if (line.startsWith("failed:")) {
-      return "failed";
     }
   }
 

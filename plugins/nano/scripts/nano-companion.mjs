@@ -28,9 +28,11 @@ import {
   buildRunLogEntry,
   DEFAULT_BASH_ALLOW,
   getClaudeAvailability,
+  isToolUseProgressLine,
   KEY_SETUP_COMMAND,
   normalizeBashAllow,
   parseClaudeJsonOutput,
+  parseStreamEvent,
   parseClaudeVersion,
   PROMPT_ARGV_LIMIT,
   requireApiKey,
@@ -251,15 +253,31 @@ async function handleSetup(argv) {
 
 /**
  * request = { cwd, prompt, model, profile ("read"|"write"|profile object),
- *   bashAllow, resumeSessionId, onProgress }
+ *   bashAllow, resumeSessionId, streaming, onProgress, onSession }
  *
  * The API key is resolved fresh here (never taken from `request`), so a
  * queued background job's stored request never contains it. Returns
  * `{ exitStatus, summary (null if no JSON), permissions, model, stderr,
  * stdout }`. `exitStatus` is 0 only if the process exited 0 AND the stdout
  * parsed as JSON AND `summary.isError` is false.
+ *
+ * With `streaming` the run uses `--output-format stream-json --verbose` and
+ * each stdout line is fed to parseStreamEvent: progress strings are passed to
+ * `onProgress` (so they land in the job log) and the first session id seen is
+ * passed to `onSession`. The final summary still comes from the last
+ * `type: "result"` line via parseClaudeJsonOutput.
  */
-async function executeClaudeRun({ cwd, prompt, model, profile, bashAllow, resumeSessionId = null, onProgress = null }) {
+async function executeClaudeRun({
+  cwd,
+  prompt,
+  model,
+  profile,
+  bashAllow,
+  resumeSessionId = null,
+  streaming = false,
+  onProgress = null,
+  onSession = null
+}) {
   const permissions = typeof profile === "object" && profile !== null ? profile : buildPermissionProfile(profile, { bashAllow });
 
   const { key: apiKey } = requireApiKey();
@@ -270,7 +288,7 @@ async function executeClaudeRun({ cwd, prompt, model, profile, bashAllow, resume
     model,
     profile: permissions,
     resumeSessionId,
-    outputFormat: "json",
+    outputFormat: streaming ? "stream-json" : "json",
     promptViaStdin
   });
 
@@ -278,11 +296,33 @@ async function executeClaudeRun({ cwd, prompt, model, profile, bashAllow, resume
     onProgress(`Running NanoGPT (${model}, profile=${permissions.name})...`);
   }
 
+  let sessionIdSeen = false;
+  const onStdoutLine = streaming
+    ? (line) => {
+        const event = parseStreamEvent(line, { cwd });
+        if (!event) {
+          return;
+        }
+        if (event.sessionId && !sessionIdSeen) {
+          sessionIdSeen = true;
+          if (typeof onSession === "function") {
+            onSession(event.sessionId);
+          }
+        }
+        for (const text of event.progress) {
+          if (typeof onProgress === "function") {
+            onProgress(text);
+          }
+        }
+      }
+    : null;
+
   const result = await runClaude({
     cwd,
     args,
     env,
-    input: promptViaStdin ? prompt : null
+    input: promptViaStdin ? prompt : null,
+    onStdoutLine
   });
 
   const parsed = parseClaudeJsonOutput(result.stdout);
@@ -414,7 +454,9 @@ async function executeTaskRun(request) {
     profile: request.profile,
     bashAllow: request.bashAllow,
     resumeSessionId: request.resumeSessionId ?? null,
-    onProgress: request.onProgress
+    streaming: request.streaming ?? false,
+    onProgress: request.onProgress,
+    onSession: request.onSession
   });
 
   const { rendered, footer } = renderTaskRun({
@@ -810,6 +852,27 @@ async function handleTaskWorker(argv) {
     }
   );
 
+  // Persist the Claude session id into the stored job as soon as the stream
+  // reports it, so `task --continue` works for a still-running (or cancelled)
+  // job, not just a finished one. The API key is never on this path: it is
+  // resolved inside executeClaudeRun and not part of the stored request.
+  const onSession = (claudeSessionId) => {
+    writeJobFile(workspaceRoot, storedJob.id, {
+      ...readStoredJob(workspaceRoot, storedJob.id),
+      claudeSessionId
+    });
+    upsertJob(workspaceRoot, { id: storedJob.id, claudeSessionId, phase: "running" });
+  };
+
+  let phaseRunningSeen = false;
+  const onProgress = (text) => {
+    if (!phaseRunningSeen && isToolUseProgressLine(text)) {
+      phaseRunningSeen = true;
+      upsertJob(workspaceRoot, { id: storedJob.id, phase: "running" });
+    }
+    progress(text);
+  };
+
   await runTrackedJob(
     {
       ...storedJob,
@@ -819,7 +882,9 @@ async function handleTaskWorker(argv) {
     () =>
       executeTaskRun({
         ...request,
-        onProgress: progress
+        streaming: true,
+        onProgress,
+        onSession
       }),
     { logFile }
   );

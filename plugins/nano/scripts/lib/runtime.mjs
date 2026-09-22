@@ -376,6 +376,15 @@ export function describeToolUse(name, input = {}, options = {}) {
   return text;
 }
 
+// True for progress lines describeToolUse produces, i.e. lines that start with
+// a tool name. Used to flip a background job's phase to "running" and to infer
+// phases for job records written before `phase` was stored.
+const TOOL_PROGRESS_LINE_PATTERN = /^(Read|Glob|Grep|Edit|Write|Bash|NotebookEdit)(\s|$)/;
+
+export function isToolUseProgressLine(text) {
+  return TOOL_PROGRESS_LINE_PATTERN.test(String(text ?? "").trim());
+}
+
 /**
  * Parse one `--output-format stream-json --verbose` line into a normalized
  * shape: `{ event, sessionId, progress, result }`. Returns null for blank or
