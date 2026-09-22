@@ -97,6 +97,10 @@ test("Stop hook is a no-op by default (gate disabled): exits 0, no block decisio
   assert.equal(result.status, 0, result.stderr);
   // No JSON decision payload should be emitted on stdout when the gate is off.
   assert.equal(result.stdout.trim(), "");
+  // The gate being off means the hook does nothing at all: no NanoGPT review
+  // task is run, so the fake claude is never invoked.
+  const invocationsLog = path.join(rt.binDir, "claude-invocations.log");
+  assert.equal(fs.existsSync(invocationsLog), false, "the stop hook must not invoke claude when the gate is off");
 });
 
 test("Stop hook with a fresh (default) config does not trigger a review", () => {
@@ -165,6 +169,19 @@ test("Stop hook runs the review task with the read-only tool profile", () => {
   assert.equal(invocations.length, 1);
   assert.equal(invocations[0].tools, "Read,Glob,Grep");
   assert.equal(invocations[0].allowedTools, "Read,Glob,Grep");
+});
+
+test("Stop hook passes --max-turns 15 to the review task", () => {
+  const rt = setupRuntime({ behavior: "ok" });
+  enableGate(rt);
+
+  const result = runStopHook(rt, { cwd: rt.repoDir, last_assistant_message: "edited a file" });
+  assert.equal(result.status, 0, result.stderr);
+
+  const invocationsLog = path.join(rt.binDir, "claude-invocations.log");
+  const invocations = readInvocations(invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].maxTurns, "15");
 });
 
 test("Stop hook passes a very large last message to the review through stdin, not argv", () => {

@@ -22,6 +22,7 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /```typescript/);
   assert.match(source, /review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
+  assert.match(source, /\[--max-turns <n>\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/nano-companion\.mjs" review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"NanoGPT review"/);
@@ -49,7 +50,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
-  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[focus \.\.\.\]/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[--max-turns <n>\] \[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/nano-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"NanoGPT adversarial review"/);
@@ -94,6 +95,7 @@ test("rescue command forwards to the nano-rescue subagent verbatim", () => {
   assert.match(rescue, /\[--continue\]/);
   assert.match(rescue, /\[--model <model>\]/);
   assert.match(rescue, /\[--thinking\]/);
+  assert.match(rescue, /\[--max-turns <n>\]/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current NanoGPT session/);
@@ -122,6 +124,10 @@ test("rescue command forwards to the nano-rescue subagent verbatim", () => {
   assert.match(agent, /Leave model unset by default/i);
   assert.match(agent, /Return the stdout of the `nano-companion` command exactly as-is/i);
   assert.match(agent, /If the Bash call fails or NanoGPT cannot be invoked, return nothing/i);
+  // Not proactive: the agent only runs when the user explicitly asks for NanoGPT.
+  assert.doesNotMatch(agent, /proactive/i);
+  assert.match(agent, /explicitly asks? to hand work to NanoGPT/i);
+  assert.match(agent, /--max-turns <n>/);
 
   assert.match(runtimeSkill, /only job is to invoke `task` once and return that stdout unchanged/i);
   assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
@@ -184,6 +190,8 @@ test("setup command points users to the keychain command for the API key", () =>
   assert.match(setup, /--model/);
   assert.match(setup, /--allow-bash/);
   assert.match(setup, /--disallow-bash/);
+  assert.match(setup, /opt-in/i);
+  assert.match(setup, /uses weekly quota every time/i);
 });
 
 test("review and adversarial-review prompts use nano review framing", () => {

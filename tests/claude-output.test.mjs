@@ -369,6 +369,7 @@ test("buildRunLogEntry mirrors bin/nano-agent field names and order", () => {
     "ms",
     "denials",
     "session",
+    "quotaDelta",
     "task"
   ]);
   assert.deepEqual(entry, {
@@ -384,8 +385,31 @@ test("buildRunLogEntry mirrors bin/nano-agent field names and order", () => {
     ms: 1234,
     denials: 1,
     session: "sid-1",
+    quotaDelta: null,
     task: "do something"
   });
+});
+
+test("buildRunLogEntry records a quotaDelta when given one", () => {
+  const now = new Date("2026-01-02T03:04:05.678Z");
+  const summary = {
+    isError: false,
+    numTurns: 3,
+    usage: { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 500 },
+    durationMs: 1234,
+    permissionDenials: [],
+    sessionId: "sid-1"
+  };
+  const entry = buildRunLogEntry({
+    model: "z-ai/glm-5.2",
+    cwd: "/repo",
+    allowedTools: ["Read"],
+    task: "do something",
+    summary,
+    quotaDelta: 1200000,
+    now
+  });
+  assert.equal(entry.quotaDelta, 1200000);
 });
 
 test("buildRunLogEntry defaults missing usage values to 0 and truncates task", () => {
@@ -504,6 +528,61 @@ test("renderRunFooter appends denied= when there are denials", () => {
 test("renderRunFooter uses defaults for missing values", () => {
   const footer = renderRunFooter({ model: "m", summary: {} });
   assert.equal(footer, "[nano] model=m turns=? tokens=0in/0out secs=0 session=none");
+});
+
+const BASE_SUMMARY = {
+  numTurns: 3,
+  durationMs: 1234,
+  sessionId: "sid",
+  usage: { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 500 },
+  permissionDenials: []
+};
+
+test("renderRunFooter appends quota= and week= between session= and denied=, in order", () => {
+  const footer = renderRunFooter({
+    model: "z-ai/glm-5.2",
+    summary: {
+      ...BASE_SUMMARY,
+      permissionDenials: [{ tool_name: "Bash", tool_input: { command: "rm" } }]
+    },
+    quota: { delta: 1_200_000, weeklyUsed: 14_400_000, weeklyLimit: 60_000_000, weekPercent: 24 }
+  });
+  assert.equal(
+    footer,
+    "[nano] model=z-ai/glm-5.2 turns=3 tokens=1500in/200out secs=1 session=sid quota=+1.2M week=24% denied=Bash(rm)"
+  );
+});
+
+test("renderRunFooter omits quota= when delta is null but still shows week=", () => {
+  const footer = renderRunFooter({
+    model: "z-ai/glm-5.2",
+    summary: BASE_SUMMARY,
+    quota: { delta: null, weeklyUsed: 14_400_000, weeklyLimit: 60_000_000, weekPercent: 24 }
+  });
+  assert.equal(footer, "[nano] model=z-ai/glm-5.2 turns=3 tokens=1500in/200out secs=1 session=sid week=24%");
+});
+
+test("renderRunFooter omits a negative delta (weekly reset mid-run) but still shows week=", () => {
+  const footer = renderRunFooter({
+    model: "z-ai/glm-5.2",
+    summary: BASE_SUMMARY,
+    quota: { delta: -49_900_000, weeklyUsed: 100_000, weeklyLimit: 60_000_000, weekPercent: 0 }
+  });
+  assert.equal(footer, "[nano] model=z-ai/glm-5.2 turns=3 tokens=1500in/200out secs=1 session=sid week=0%");
+});
+
+test("renderRunFooter shows quota= without week= when weekPercent is not computable", () => {
+  const footer = renderRunFooter({
+    model: "z-ai/glm-5.2",
+    summary: BASE_SUMMARY,
+    quota: { delta: 1_200_000, weeklyUsed: null, weeklyLimit: null, weekPercent: null }
+  });
+  assert.equal(footer, "[nano] model=z-ai/glm-5.2 turns=3 tokens=1500in/200out secs=1 session=sid quota=+1.2M");
+});
+
+test("renderRunFooter omits both quota= and week= when quota is null", () => {
+  const footer = renderRunFooter({ model: "z-ai/glm-5.2", summary: BASE_SUMMARY, quota: null });
+  assert.equal(footer, "[nano] model=z-ai/glm-5.2 turns=3 tokens=1500in/200out secs=1 session=sid");
 });
 
 test("truncateInline returns text unchanged when within limit", () => {

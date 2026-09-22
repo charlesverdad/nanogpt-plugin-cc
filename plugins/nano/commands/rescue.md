@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the NanoGPT rescue subagent
-argument-hint: "[--background|--wait] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [what NanoGPT should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [what NanoGPT should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -19,7 +19,8 @@ Execution mode:
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to the subagent, and do not treat them as part of the natural-language task text.
 - `--model` is a runtime-selection flag. Preserve it for the forwarded request, but do not treat it as part of the natural-language task text.
 - `--thinking` is a runtime-selection flag. Preserve it for the forwarded request, but do not treat it as part of the natural-language task text.
-- `--read-only`, `--allow-bash <prefix>` (repeatable), and `--allow-paid` are runtime-selection flags. Preserve them for the forwarded request, but do not treat them as part of the natural-language task text.
+- `--read-only`, `--allow-bash <prefix>` (repeatable), `--allow-paid`, and `--max-turns <n>` are runtime-selection flags. Preserve them for the forwarded request, but do not treat them as part of the natural-language task text.
+- `--max-turns <n>` caps the run at n turns (default 25). Every turn resends the conversation and counts against the NanoGPT weekly quota, cached input included.
 - If the request includes `--continue`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting NanoGPT, check for a resumable task from this Claude session by running:
 

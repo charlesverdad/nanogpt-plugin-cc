@@ -9,13 +9,15 @@ import {
   normalizeBashAllow,
   buildPermissionProfile,
   buildClaudeArgs,
+  normalizeMaxTurns,
   parseClaudeVersion,
   compareVersions,
   DEFAULT_BASE_URL,
   KEY_SETUP_COMMAND,
   KEYCHAIN_SERVICE,
   STRIPPED_ENV_VARS,
-  DEFAULT_BASH_ALLOW
+  DEFAULT_BASH_ALLOW,
+  MAX_TURNS_LIMIT
 } from "../plugins/nano/scripts/lib/runtime.mjs";
 
 function fakeRunCommandImpl(over = {}) {
@@ -444,6 +446,56 @@ test("buildClaudeArgs: throws for empty prompt", () => {
 
 test('buildClaudeArgs: throws for unsupported outputFormat "text"', () => {
   assert.throws(() => buildClaudeArgs({ prompt: "hi", model: "m", outputFormat: "text" }), /output format/);
+});
+
+test("buildClaudeArgs: --max-turns n goes right after --strict-mcp-config", () => {
+  const args = buildClaudeArgs({ prompt: "hi", model: "m", maxTurns: 7 });
+  const strictIdx = args.indexOf("--strict-mcp-config");
+  assert.equal(args[strictIdx + 1], "--max-turns");
+  assert.equal(args[strictIdx + 2], "7");
+});
+
+test("buildClaudeArgs: with maxTurns null, no --max-turns flag is added", () => {
+  const args = buildClaudeArgs({ prompt: "hi", model: "m" });
+  assert.equal(args.includes("--max-turns"), false);
+});
+
+// ---------------------------------------------------------------------------
+// normalizeMaxTurns
+// ---------------------------------------------------------------------------
+
+test("normalizeMaxTurns: null/undefined pass through as null", () => {
+  assert.equal(normalizeMaxTurns(null), null);
+  assert.equal(normalizeMaxTurns(undefined), null);
+});
+
+test("normalizeMaxTurns: accepts the string \"7\"", () => {
+  assert.equal(normalizeMaxTurns("7"), 7);
+});
+
+test("normalizeMaxTurns: accepts a plain number", () => {
+  assert.equal(normalizeMaxTurns(25), 25);
+  assert.equal(normalizeMaxTurns(MAX_TURNS_LIMIT), MAX_TURNS_LIMIT);
+  assert.equal(normalizeMaxTurns(1), 1);
+});
+
+test("normalizeMaxTurns: rejects 0", () => {
+  assert.throws(() => normalizeMaxTurns(0), /Invalid --max-turns/);
+  assert.throws(() => normalizeMaxTurns("0"), /Invalid --max-turns/);
+});
+
+test("normalizeMaxTurns: rejects 501 (above MAX_TURNS_LIMIT)", () => {
+  assert.throws(() => normalizeMaxTurns(501), /Invalid --max-turns/);
+  assert.throws(() => normalizeMaxTurns("501"), /Invalid --max-turns/);
+});
+
+test("normalizeMaxTurns: rejects 2.5 (not an integer)", () => {
+  assert.throws(() => normalizeMaxTurns(2.5), /Invalid --max-turns/);
+  assert.throws(() => normalizeMaxTurns("2.5"), /Invalid --max-turns/);
+});
+
+test('normalizeMaxTurns: rejects "abc"', () => {
+  assert.throws(() => normalizeMaxTurns("abc"), /Invalid --max-turns/);
 });
 
 // ---------------------------------------------------------------------------

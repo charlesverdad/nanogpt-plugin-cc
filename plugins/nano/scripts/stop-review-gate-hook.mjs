@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { readStdinSync } from "./lib/fs.mjs";
-import { getClaudeAvailability, resolveApiKey } from "./lib/runtime.mjs";
+import { getClaudeAvailability, resolveApiKey, DEFAULT_REVIEW_MAX_TURNS } from "./lib/runtime.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
@@ -114,7 +114,7 @@ function runStopReview(cwd, input = {}) {
   // The prompt embeds Claude's last message, which can exceed the per-argument
   // argv limit, so it goes through stdin (task reads stdin when no positional
   // prompt is given).
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--read-only"], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--read-only", "--max-turns", String(DEFAULT_REVIEW_MAX_TURNS)], {
     cwd,
     env: childEnv,
     input: prompt,

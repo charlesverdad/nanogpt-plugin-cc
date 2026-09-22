@@ -25,6 +25,9 @@ export const FAKE_API_KEY = "nano-test-key-DO-NOT-LEAK-7f3a";
  *   - "denials"   is_error:false with two permission_denials entries, exit 0.
  *   - "no-json"   print `this is not json` to stdout, exit 1.
  *   - "long"      like "ok" but result is 20000 "L" characters, exit 0.
+ *   - "max-turns" print an error_max_turns result (as real claude does when the
+ *                 --max-turns cap is hit: num_turns = cap+1, empty result,
+ *                 terminal_reason "max_turns"), exit 1.
  *   - "slow"      wait options.delayMs then behave like "ok".
  *   - "crash-after-init"  stream-json: print the init and one assistant
  *                 tool_use line, then exit 1 with NO result object (json:
@@ -131,6 +134,7 @@ function parseRunArgs(args) {
     outputFormat: null,
     verbose: false,
     resume: null,
+    maxTurns: null,
     restricted: false,
     strictMcpConfig: false,
     print: false,
@@ -188,6 +192,11 @@ function parseRunArgs(args) {
       }
     } else if (token.startsWith("--resume=")) {
       parsed.resume = token.slice("--resume=".length);
+    } else if (token === "--max-turns") {
+      parsed.maxTurns = args[i + 1] ?? null;
+      i += 1;
+    } else if (token.startsWith("--max-turns=")) {
+      parsed.maxTurns = token.slice("--max-turns=".length);
     }
   }
   if (parsed.prompt === null && !sawDashDash) {
@@ -258,6 +267,7 @@ function recordInvocation() {
     outputFormat: run.outputFormat,
     verbose: run.verbose,
     resume: run.resume,
+    maxTurns: run.maxTurns,
     restricted: run.restricted,
     strictMcpConfig: run.strictMcpConfig,
     envNames: envNames,
@@ -281,6 +291,31 @@ function buildResultObject() {
   let result;
   let permission_denials = [];
   let exitCode = 0;
+
+  if (effBehavior === "max-turns") {
+    // Matches real claude when the --max-turns cap is hit: exit 1 with a
+    // normal result JSON of subtype error_max_turns.
+    const cap = Number.parseInt(run.maxTurns, 10) || 25;
+    return {
+      type: "result",
+      subtype: "error_max_turns",
+      is_error: true,
+      terminal_reason: "max_turns",
+      num_turns: cap + 1,
+      result: "",
+      errors: ["Reached maximum number of turns (" + cap + ")"],
+      session_id: sessionId,
+      duration_ms: 1234,
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 200,
+        cache_read_input_tokens: 500,
+        cache_creation_input_tokens: 0
+      },
+      permission_denials: [],
+      _exitCode: 1
+    };
+  }
 
   if (effBehavior === "ok") {
     is_error = false;

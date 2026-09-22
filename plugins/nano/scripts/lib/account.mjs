@@ -268,6 +268,34 @@ export function formatTokenCount(n) {
 }
 
 /**
+ * Combine the subscription usage snapshots taken just before and just after a
+ * claude run into a per-run quota object:
+ * `{ delta, weeklyUsed, weeklyLimit, weekPercent }`.
+ *
+ * `delta` is the change in `weeklyUsed` across the run (null unless both
+ * snapshots succeeded with numbers; it can be negative only when the weekly
+ * window reset mid-run). `weekPercent` is the after-snapshot usage as a
+ * whole-percent of the weekly limit (null when not computable). Returns null
+ * when the after-snapshot failed — a quota read must never fail the run.
+ */
+export function buildRunQuota(before, after) {
+  if (!after || after.ok !== true) {
+    return null;
+  }
+  const weeklyUsed = typeof after.weeklyUsed === "number" ? after.weeklyUsed : null;
+  const weeklyLimit = typeof after.weeklyLimit === "number" ? after.weeklyLimit : null;
+  let delta = null;
+  if (before && before.ok === true && typeof before.weeklyUsed === "number" && typeof after.weeklyUsed === "number") {
+    delta = after.weeklyUsed - before.weeklyUsed;
+  }
+  let weekPercent = null;
+  if (typeof after.weeklyUsed === "number" && typeof after.weeklyLimit === "number" && after.weeklyLimit > 0) {
+    weekPercent = Math.round((after.weeklyUsed / after.weeklyLimit) * 100);
+  }
+  return { delta, weeklyUsed, weeklyLimit, weekPercent };
+}
+
+/**
  * Render a one-line subscription summary from a fetchSubscriptionUsage
  * result. Examples:
  *   active, 2.2M of 60.0M weekly input tokens used (57.8M left, resets <iso>)

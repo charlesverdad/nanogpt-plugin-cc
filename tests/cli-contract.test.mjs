@@ -9,7 +9,12 @@ import {
   stripAnsi,
   normalizeHelp,
   formatContractReport,
-  HELP_ENV
+  HELP_ENV,
+  HIDDEN_FLAGS,
+  verifyHiddenFlags,
+  formatHiddenFlagsReport,
+  buildHiddenFlagProbeArgv,
+  hiddenFlagProbeEnv
 } from "../plugins/nano/scripts/lib/cli-contract.mjs";
 import { runCommand } from "../plugins/nano/scripts/lib/process.mjs";
 import { makeTempDir, run } from "./helpers.mjs";
@@ -259,6 +264,64 @@ test("verifyContract reports a fetch failure as missing, not a crash", () => {
   const verification = verifyContract(fetch);
   assert.equal(verification.ok, false);
   assert.ok(verification.missing.every((m) => /help fetch failed/.test(m.reason)));
+});
+
+// ---------------------------------------------------------------------------
+// verifyHiddenFlags
+// ---------------------------------------------------------------------------
+
+test("verifyHiddenFlags: passes when the probe's stderr does not mention an unknown option", () => {
+  const runProbe = (flag) => {
+    assert.equal(flag, "--max-turns");
+    return { status: 1, stdout: "", stderr: "some unrelated network error" };
+  };
+  const verification = verifyHiddenFlags(runProbe);
+  assert.equal(verification.ok, true);
+  assert.deepEqual(verification.missing, []);
+  assert.equal(verification.checks.length, HIDDEN_FLAGS.length);
+  assert.equal(verification.checks[0].satisfied, true);
+  assert.match(formatHiddenFlagsReport(verification), /OK/);
+});
+
+test('verifyHiddenFlags: fails on stderr "error: unknown option \'--max-turns\'"', () => {
+  const runProbe = () => ({
+    status: 1,
+    stdout: "",
+    stderr: "error: unknown option '--max-turns'"
+  });
+  const verification = verifyHiddenFlags(runProbe);
+  assert.equal(verification.ok, false);
+  assert.equal(verification.missing.length, 1);
+  assert.equal(verification.missing[0].flag, "--max-turns");
+  assert.match(verification.missing[0].reason, /unknown option/);
+  assert.match(formatHiddenFlagsReport(verification), /FAILED/);
+  assert.match(formatHiddenFlagsReport(verification), /MISSING/);
+});
+
+test("verifyHiddenFlags: fails when the runner throws", () => {
+  const runProbe = () => {
+    throw new Error("spawn claude ENOENT");
+  };
+  const verification = verifyHiddenFlags(runProbe);
+  assert.equal(verification.ok, false);
+  assert.equal(verification.missing.length, 1);
+  assert.match(verification.missing[0].reason, /probe failed: spawn claude ENOENT/);
+});
+
+test("buildHiddenFlagProbeArgv builds a minimal offline probe for the given flag", () => {
+  const argv = buildHiddenFlagProbeArgv("--max-turns");
+  assert.deepEqual(argv, ["-p", "--max-turns", "1", "--output-format", "json", "--tools=Read", "--", "ping"]);
+});
+
+test("hiddenFlagProbeEnv points at an unreachable base URL and strips ANTHROPIC_AUTH_TOKEN", () => {
+  const env = hiddenFlagProbeEnv({ ANTHROPIC_AUTH_TOKEN: "host-token", SOME_OTHER: "kept" });
+  assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:9");
+  assert.equal(env.ANTHROPIC_API_KEY, "contract-probe-not-a-key");
+  assert.equal(env.API_TIMEOUT_MS, "3000");
+  assert.equal(env.CLAUDE_CODE_MAX_RETRIES, "0");
+  assert.equal("ANTHROPIC_AUTH_TOKEN" in env, false);
+  assert.equal(env.SOME_OTHER, "kept");
+  assert.equal(env.NO_COLOR, HELP_ENV.NO_COLOR);
 });
 
 // Run the real check-cli-contract.mjs against the fake claude binary.
