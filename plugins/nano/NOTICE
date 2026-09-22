@@ -1,4 +1,4 @@
-nanogpt-plugin-cc
+NanoGPT plugin for Claude Code
 Copyright (c) 2026 charlesverdad
 
 This product is licensed under the MIT License (see LICENSE).
@@ -9,7 +9,7 @@ Third-party attribution
 
 Forked from kimi-plugin-cc (MIT), itself derived from codex-plugin-cc (Apache-2.0).
 
-This project is a derivative work of codex-plugin-cc
+This plugin is a derivative work of the Codex plugin from codex-plugin-cc
 (https://github.com/openai/codex-plugin-cc), which is licensed under the
 Apache License, Version 2.0. A copy of that license is included as
 LICENSE-APACHE. The original NOTICE from that project is reproduced below:

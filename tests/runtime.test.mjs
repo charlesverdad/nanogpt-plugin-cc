@@ -4,12 +4,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { buildEnv, installFakeKimi, readInvocations } from "./fake-kimi-fixture.mjs";
+import { buildEnv, installFakeKimi, readInvocations } from "./fake-claude-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "kimi");
-const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "kimi-companion.mjs");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "nano");
+const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "nano-companion.mjs");
 
 // Import the real state helpers so seeded jobs land in the same isolated
 // CLAUDE_PLUGIN_DATA-derived directory the companion uses.
@@ -59,7 +59,7 @@ test("setup --json reports ready when fake kimi is installed and authenticated",
   // step is the optional suggestion to enable it.
   assert.equal(payload.reviewGateEnabled, false);
   assert.deepEqual(payload.nextSteps, [
-    "Optional: run `/kimi:setup --enable-review-gate` to require a fresh review before stop."
+    "Optional: run `/nano:setup --enable-review-gate` to require a fresh review before stop."
   ]);
 });
 
@@ -87,7 +87,7 @@ test("setup (human render) reports needs attention without kimi on PATH", () => 
     PATH: binDir,
     CLAUDE_PLUGIN_DATA: dataDir
   };
-  delete env.KIMI_COMPANION_SESSION_ID;
+  delete env.NANO_COMPANION_SESSION_ID;
   // Invoke node via its absolute path since PATH no longer contains it.
   const result = run(process.execPath, [SCRIPT, "setup"], { cwd: ROOT, env });
 
@@ -129,7 +129,7 @@ test("review (human render) surfaces the assistant text", () => {
   const result = runCompanion(rt, ["review", "--scope", "working-tree"]);
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /# Kimi Review/);
+  assert.match(result.stdout, /# NanoGPT Review/);
   assert.match(result.stdout, /Fake Kimi assistant response/);
 });
 

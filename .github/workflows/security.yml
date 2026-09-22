@@ -18,11 +18,11 @@ jobs:
           node-version: '22.x'
 
       - name: Run AgentShield scan
-        run: npx -y ecc-agentshield scan --path plugins/kimi --format json > agentshield-report.json
+        run: npx -y ecc-agentshield scan --path plugins/nano --format json > agentshield-report.json
 
       - name: Show report
         if: always()
-        run: npx -y ecc-agentshield scan --path plugins/kimi
+        run: npx -y ecc-agentshield scan --path plugins/nano
 
       - name: Gate on medium+ findings
         run: node .github/scripts/agentshield-gate.mjs agentshield-report.json medium
