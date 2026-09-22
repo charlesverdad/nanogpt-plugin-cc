@@ -14,7 +14,7 @@ test("parseArgs collects positionals and bare tokens", () => {
 
 test("parseArgs reads boolean and value options, including inline and aliases", () => {
   const { options, positionals } = parseArgs(
-    ["--verbose", "--name=kimi", "-f", "out.txt", "rest"],
+    ["--verbose", "--name=nano", "-f", "out.txt", "rest"],
     {
       booleanOptions: ["verbose"],
       valueOptions: ["name", "file"],
@@ -22,7 +22,7 @@ test("parseArgs reads boolean and value options, including inline and aliases", 
     },
   );
   assert.equal(options.verbose, true);
-  assert.equal(options.name, "kimi");
+  assert.equal(options.name, "nano");
   assert.equal(options.file, "out.txt");
   assert.deepEqual(positionals, ["rest"]);
 });

@@ -1042,7 +1042,7 @@ test("cancel marks an active job as cancelled", () => {
   assert.equal(statusPayload.job.status, "cancelled");
 });
 
-// --- key never persisted (HANDOVER §4.1) --------------------------------------
+// --- key never persisted ------------------------------------------------------
 
 test("the NanoGPT API key is never persisted in state, logs, or command output", () => {
   const rt = setupRuntime("ok");

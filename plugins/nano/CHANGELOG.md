@@ -2,7 +2,7 @@
 
 ## 0.1.0
 
-- Forked from `kimi-plugin-cc` to run tasks and code reviews on NanoGPT subscription models from inside Claude Code.
+- First release: run tasks and code reviews on NanoGPT subscription models from inside Claude Code. Built on kimi-plugin-cc and following the structure of the official codex-plugin-cc.
 - Runtime: spawns Claude Code itself headless (`claude -p --restricted ...`) against NanoGPT's Anthropic-compatible endpoint, with `read` and `write` permission profiles and an explicit tool allowlist.
 - Model aliases (`default`, `heavy`, `alt`, `fast`) and a subscription guard that refuses pay-per-token models unless `--allow-paid` is passed. Catalog is fetched from NanoGPT and cached for 24h.
 - Background task execution with stream-json progress, session id capture for resume, `/nano:status`, `/nano:result`, and `/nano:cancel`.
@@ -18,16 +18,3 @@
 - Quota reporting: a NanoGPT weekly-usage snapshot is taken just before and just after every run with a resolved key (tasks, background jobs, reviews, and the stop gate). The run footer, JSON payload, job record, and metrics log (`runs.jsonl`, as `quotaDelta`) get a `quota` object showing the change in weekly usage and how full the weekly window now is (`quota=+1.2M week=24%`); a failed or slow usage fetch never fails the run, and the footer omits the parts it can't compute.
 - `nano-rescue` and the `nano-runtime` skill no longer describe themselves as proactive or free: the rescue subagent now runs only when the user explicitly asks to hand work to NanoGPT, and the docs replace "cost $0 per call" with the fact that subscription calls are included but still count against the weekly input-token quota (cached input in full).
 - The stop-time review gate's `/nano:setup` next-steps no longer suggest enabling it; `setup.md` and the README describe it as opt-in and note that it spends quota on every session stop while it is on.
-
-Earlier versions (as kimi-plugin-cc):
-
-## 1.0.1
-
-- Added a test suite covering the shared library and runtime integration (fake Kimi CLI).
-- Added a version-bump script.
-- Added a Kimi CLI version-compatibility check with CI.
-- Relicensed under the MIT License, retaining upstream Apache-2.0 attribution for codex-plugin-cc (see NOTICE / LICENSE-APACHE).
-
-## 1.0.0
-
-- Initial version of the Kimi plugin for Claude Code

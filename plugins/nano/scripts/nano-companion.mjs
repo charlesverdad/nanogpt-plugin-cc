@@ -240,8 +240,8 @@ function fetchHelpForContract(argv) {
 }
 
 /**
- * Detect a project test command for the setup next-steps suggestion
- * (HANDOVER §10). Returns `{ command, prefix }` where `command` is the full
+ * Detect a project test command for the setup next-steps suggestion.
+ * Returns `{ command, prefix }` where `command` is the full
  * suggested `/nano:setup --allow-bash ...` / `just test` / `cargo test` and
  * `prefix` is the Bash allowlist prefix it would add (so callers can skip the
  * suggestion when the prefix is already allowlisted), or null.
