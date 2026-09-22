@@ -24,7 +24,8 @@ import {
   buildRunLogEntry,
   appendRunLog,
   runClaude,
-  buildClaudeArgs
+  buildClaudeArgs,
+  shouldSendPromptViaStdin
 } from "../plugins/nano/scripts/lib/runtime.mjs";
 
 import {
@@ -39,7 +40,7 @@ import {
 
 test("PROMPT_ARGV_LIMIT and DEFAULT_MAX_INLINE_CHARS are exported constants", () => {
   assert.equal(typeof PROMPT_ARGV_LIMIT, "number");
-  assert.equal(PROMPT_ARGV_LIMIT, 100000);
+  assert.equal(PROMPT_ARGV_LIMIT, 64 * 1024);
   assert.equal(typeof DEFAULT_MAX_INLINE_CHARS, "number");
   assert.equal(DEFAULT_MAX_INLINE_CHARS, 8000);
 });
@@ -129,6 +130,33 @@ test("parseClaudeJsonOutput ignores non-object JSON", () => {
 
 test("parseClaudeJsonOutput returns null for non-json input", () => {
   assert.equal(parseClaudeJsonOutput("this is not json"), null);
+});
+
+test("parseClaudeJsonOutput returns null for a single JSON object that is not a result", () => {
+  // e.g. a stream-json run that died right after its init event
+  assert.equal(parseClaudeJsonOutput('{"type":"system","subtype":"init","session_id":"s1"}'), null);
+  assert.equal(parseClaudeJsonOutput('{"error":"boom"}'), null);
+});
+
+// ---------------------------------------------------------------------------
+// shouldSendPromptViaStdin
+// ---------------------------------------------------------------------------
+
+test("shouldSendPromptViaStdin: small prompts stay in argv off Windows", () => {
+  assert.equal(shouldSendPromptViaStdin("hello", "linux"), false);
+  assert.equal(shouldSendPromptViaStdin("a".repeat(PROMPT_ARGV_LIMIT), "darwin"), false);
+  assert.equal(shouldSendPromptViaStdin("a".repeat(PROMPT_ARGV_LIMIT + 1), "linux"), true);
+});
+
+test("shouldSendPromptViaStdin: the limit counts UTF-8 bytes, not characters", () => {
+  // 30k three-byte characters: well under the limit in characters, ~90 KiB in bytes.
+  const prompt = "\u4e2d".repeat(30000);
+  assert.ok(prompt.length < PROMPT_ARGV_LIMIT);
+  assert.equal(shouldSendPromptViaStdin(prompt, "linux"), true);
+});
+
+test("shouldSendPromptViaStdin: always stdin on Windows", () => {
+  assert.equal(shouldSendPromptViaStdin("hi", "win32"), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -302,10 +330,11 @@ test("resolveRunLogFile uses CLAUDE_PLUGIN_DATA when set", () => {
   assert.equal(resolveRunLogFile({ CLAUDE_PLUGIN_DATA: "/data" }), path.join("/data", "runs.jsonl"));
 });
 
-test("resolveRunLogFile falls back to tmpdir/nano-companion", () => {
+test("resolveRunLogFile falls back to a per-user tmpdir/nano-companion-<uid>", () => {
+  const owner = typeof process.getuid === "function" ? String(process.getuid()) : os.userInfo().username;
   assert.equal(
     resolveRunLogFile({}),
-    path.join(os.tmpdir(), "nano-companion", "runs.jsonl")
+    path.join(os.tmpdir(), `nano-companion-${owner}`, "runs.jsonl")
   );
 });
 

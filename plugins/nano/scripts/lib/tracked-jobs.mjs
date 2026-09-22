@@ -4,6 +4,11 @@ import process from "node:process";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "NANO_COMPANION_SESSION_ID";
+// Set by the stop-review-gate hook on the `task` it spawns; the companion
+// records it as `origin` on the job so the gate's reviews are never picked
+// up by `task --continue`.
+export const JOB_ORIGIN_ENV = "NANO_COMPANION_JOB_ORIGIN";
+export const STOP_GATE_ORIGIN = "stop-gate";
 
 export function nowIso() {
   return new Date().toISOString();

@@ -9,10 +9,10 @@
 // keyed by baseUrl. The API key is never persisted to the cache.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import { DEFAULT_BASE_URL } from "./runtime.mjs";
+import { ensurePrivateDir, resolveFallbackDataDir } from "./state.mjs";
 
 export const DEFAULT_MODEL = "z-ai/glm-5.2";
 
@@ -65,10 +65,7 @@ export const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
  * back to a per-user tmp dir, mirroring state.mjs/runs.jsonl.
  */
 export function resolveCatalogCacheFile(env = process.env) {
-  return path.join(
-    env.CLAUDE_PLUGIN_DATA || path.join(os.tmpdir(), "nano-companion"),
-    "models-cache.json"
-  );
+  return path.join(env.CLAUDE_PLUGIN_DATA || resolveFallbackDataDir(), "models-cache.json");
 }
 
 /**
@@ -152,6 +149,15 @@ export async function fetchModelCatalog({
   return normalized;
 }
 
+function privateDirUsable(dir) {
+  try {
+    ensurePrivateDir(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function readCacheFile(cacheFile) {
   try {
     const raw = readFileSync(cacheFile, "utf8");
@@ -195,7 +201,10 @@ export async function loadModelCatalog({
   refresh = false
 } = {}) {
   const cacheFile = resolveCatalogCacheFile(env);
-  const cached = readCacheFile(cacheFile);
+  // A shared-tmp fallback dir someone else owns could hold a planted catalog
+  // marking a paid model "included"; skip the cache entirely in that case.
+  const cacheUsable = Boolean(env.CLAUDE_PLUGIN_DATA) || privateDirUsable(path.dirname(cacheFile));
+  const cached = cacheUsable ? readCacheFile(cacheFile) : null;
   const base = baseUrl ?? DEFAULT_BASE_URL;
 
   if (!refresh && cached && cached.baseUrl === base && now - cached.fetchedAt < maxAgeMs) {
@@ -210,7 +219,9 @@ export async function loadModelCatalog({
   try {
     const models = await fetchModelCatalog({ apiKey, baseUrl: base, fetchImpl });
     const entry = { fetchedAt: now, baseUrl: base, models };
-    writeCacheFile(cacheFile, entry);
+    if (cacheUsable) {
+      writeCacheFile(cacheFile, entry);
+    }
     return { models, source: "network", fetchedAt: now, error: null };
   } catch (error) {
     if (cached && cached.baseUrl === base) {

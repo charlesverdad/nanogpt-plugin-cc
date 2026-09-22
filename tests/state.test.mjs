@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import process from "node:process";
 
 import { makeTempDir } from "./helpers.mjs";
 import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/nano/scripts/lib/state.mjs";
@@ -112,4 +114,48 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+// Runs `resolveStateDir` in a child process with TMPDIR pointed at a scratch
+// dir and CLAUDE_PLUGIN_DATA unset, so the per-user fallback is exercised
+// without touching the real temp dir.
+function resolveFallbackStateDirIn(tmpRoot, workspace) {
+  const stateModule = new URL("../plugins/nano/scripts/lib/state.mjs", import.meta.url).href;
+  const env = { ...process.env, TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot };
+  delete env.CLAUDE_PLUGIN_DATA;
+  return spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `const { resolveStateDir } = await import(${JSON.stringify(stateModule)}); console.log(resolveStateDir(${JSON.stringify(workspace)}));`
+    ],
+    { env, encoding: "utf8" }
+  );
+}
+
+test("the CLAUDE_PLUGIN_DATA fallback is a per-user tmp dir kept at mode 0700", { skip: process.platform === "win32" }, () => {
+  const tmpRoot = fs.realpathSync.native(makeTempDir("nano-fallback-"));
+  const workspace = makeTempDir();
+  const owner = String(process.getuid());
+  const fallbackDir = path.join(tmpRoot, `nano-companion-${owner}`);
+  // Pre-create it too permissive; the state module must tighten it.
+  fs.mkdirSync(fallbackDir, { mode: 0o755 });
+  fs.chmodSync(fallbackDir, 0o755);
+
+  const result = resolveFallbackStateDirIn(tmpRoot, workspace);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim().startsWith(path.join(fallbackDir, "state")), true, result.stdout);
+  assert.equal(fs.statSync(fallbackDir).mode & 0o777, 0o700);
+});
+
+test("the CLAUDE_PLUGIN_DATA fallback refuses a symlinked (possibly foreign) dir", { skip: process.platform === "win32" }, () => {
+  const tmpRoot = fs.realpathSync.native(makeTempDir("nano-fallback-"));
+  const workspace = makeTempDir();
+  const elsewhere = makeTempDir("nano-elsewhere-");
+  fs.symlinkSync(elsewhere, path.join(tmpRoot, `nano-companion-${process.getuid()}`));
+
+  const result = resolveFallbackStateDirIn(tmpRoot, workspace);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Refusing to use .*not a directory owned by the current user/);
 });

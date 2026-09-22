@@ -33,7 +33,7 @@ Calling the companion directly:
 
 - The main Claude thread may also invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/nano-companion.mjs" task ...` directly via `Bash`, skipping the `nano:nano-rescue` forwarder entirely, when it wants the cheapest path. This avoids the subagent hop.
 - The `task` flags are: `--background`, `--continue`, `--model <id|alias>`, `--thinking`, `--read-only`, `--allow-bash <prefix>` (repeatable), `--allow-paid`, and `--json`.
-- The run footer (`[nano] ...`) is printed on stdout. If the footer shows `denied=...`, a tool call was denied by the restricted child; rerun with `--allow-bash "<prefix>"` to grant the missing command rather than working around it.
+- The run footer (`[nano] ...`) is printed on stdout. If the footer shows `denied=...`, a tool call was denied by the restricted child; rerun with `--allow-bash "<prefix>"` to grant the missing command rather than working around it. The default allowlist is only `git status` and `ls`. Never add a prefix that runs repository code (test runners, build tools) or takes an output-file option unless the user asked for it: such a prefix lets the model execute or write anything.
 
 Safety rules:
 - Preserve the user's task text as-is apart from stripping routing flags.

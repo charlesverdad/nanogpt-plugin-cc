@@ -12,11 +12,12 @@ import { DEFAULT_BASH_ALLOW, KEY_SETUP_COMMAND } from "../plugins/nano/scripts/l
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "nano");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "nano-companion.mjs");
+const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 
 // Import the real state helpers so seeded jobs/config land in the same
 // isolated CLAUDE_PLUGIN_DATA-derived directory the companion uses.
 const STATE_MODULE = pathToFileURL(path.join(PLUGIN_ROOT, "scripts", "lib", "state.mjs")).href;
-const { setConfig, upsertJob, writeJobFile, resolveJobFile, resolveJobLogFile } = await import(STATE_MODULE);
+const { listJobs, setConfig, upsertJob, writeJobFile, resolveJobFile, resolveJobLogFile } = await import(STATE_MODULE);
 
 /**
  * Shadow the real `security` (macOS) / `secret-tool` (Linux) binaries with
@@ -275,7 +276,9 @@ test("task with no flags runs the write profile with the default Bash allowlist"
   assert.equal(invocations.length, 1);
   assert.equal(invocations[0].tools, "Read,Glob,Grep,Edit,Write,Bash");
   assert.match(invocations[0].allowedTools, /Edit\(\.\/\*\*\)/);
-  assert.match(invocations[0].allowedTools, /Bash\(git diff:\*\)/);
+  assert.match(invocations[0].allowedTools, /Bash\(git status:\*\)/);
+  // git diff/log/show take --output=<file>, which writes anywhere: not default.
+  assert.doesNotMatch(invocations[0].allowedTools, /Bash\(git (diff|log|show):\*\)/);
 
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.profile, "write");
@@ -302,7 +305,7 @@ test("--allow-bash extends the write profile's Bash allowlist", () => {
   assert.equal(result.status, 0, result.stderr);
   const invocations = readInvocations(rt.invocationsLog);
   assert.match(invocations[0].allowedTools, /Bash\(npm test:\*\)/);
-  assert.match(invocations[0].allowedTools, /Bash\(git diff:\*\)/);
+  assert.match(invocations[0].allowedTools, /Bash\(git status:\*\)/);
 });
 
 test("--read-only combined with --allow-bash is an error", () => {
@@ -687,6 +690,128 @@ test("a background task can be cancelled while running and resumed with --contin
   assert.equal(resumeInvocations.length, 2);
   assert.equal(resumeInvocations[1].resume, claudeSessionId);
   assert.match(resumeInvocations[1].prompt, /keep going/);
+});
+
+test("task --continue skips stop-gate review jobs and resumes the rescue session with the write profile", () => {
+  const rt = setupRuntime("ok");
+  const env = { ...rt.env, NANO_COMPANION_SESSION_ID: "claude-session-1" };
+
+  const rescue = runCompanion(rt, ["task", "--json", "Fix the parser"], { env });
+  assert.equal(rescue.status, 0, rescue.stderr);
+  const rescuePayload = JSON.parse(rescue.stdout);
+  assert.equal(rescuePayload.profile, "write");
+  assert.ok(rescuePayload.claudeSessionId);
+
+  // The stop gate runs a read-only review task in the same Claude session.
+  withPluginData(rt.dataDir, () => setConfig(rt.repoDir, "stopReviewGate", true));
+  const gate = run(process.execPath, [STOP_HOOK], {
+    cwd: rt.repoDir,
+    env,
+    input: JSON.stringify({ session_id: "claude-session-1", cwd: rt.repoDir, last_assistant_message: "Done fixing." })
+  });
+  assert.equal(gate.status, 0, gate.stderr);
+  const afterGate = readInvocations(rt.invocationsLog);
+  assert.equal(afterGate.length, 2);
+  assert.equal(afterGate[1].tools, "Read,Glob,Grep");
+  assert.match(afterGate[1].prompt, /Done fixing\./);
+
+  const jobs = withPluginData(rt.dataDir, () => listJobs(rt.repoDir));
+  const gateJobs = jobs.filter((job) => job.origin === "stop-gate");
+  assert.equal(gateJobs.length, 1);
+  assert.equal(gateJobs[0].status, "completed");
+
+  const candidate = runCompanion(rt, ["task-resume-candidate", "--json"], { env });
+  assert.equal(candidate.status, 0, candidate.stderr);
+  const candidatePayload = JSON.parse(candidate.stdout);
+  assert.equal(candidatePayload.available, true);
+  assert.notEqual(candidatePayload.candidate.id, gateJobs[0].id);
+
+  const resume = runCompanion(rt, ["task", "--json", "--continue", "apply the fix"], { env });
+  assert.equal(resume.status, 0, resume.stderr);
+  assert.equal(JSON.parse(resume.stdout).profile, "write");
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 3);
+  assert.equal(invocations[2].resume, rescuePayload.claudeSessionId);
+  assert.equal(invocations[2].tools, "Read,Glob,Grep,Edit,Write,Bash");
+});
+
+test("a background run that dies after reporting its session keeps the session id for --continue", () => {
+  const rt = setupRuntime("crash-after-init");
+  const launch = runCompanion(rt, ["task", "--json", "--background", "Crashy work"]);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const waited = runCompanion(rt, [
+    "status",
+    jobId,
+    "--wait",
+    "--json",
+    "--timeout-ms",
+    "15000",
+    "--poll-interval-ms",
+    "200"
+  ]);
+  assert.equal(waited.status, 0, waited.stderr);
+  const snapshot = JSON.parse(waited.stdout);
+  assert.equal(snapshot.job.status, "failed");
+
+  const logText = fs.readFileSync(snapshot.job.logFile, "utf8");
+  const [, loggedSessionId] = logText.match(/NanoGPT session (\S+) started/);
+  const stored = withPluginData(rt.dataDir, () => JSON.parse(fs.readFileSync(resolveJobFile(rt.repoDir, jobId), "utf8")));
+  assert.equal(stored.claudeSessionId, loggedSessionId);
+  assert.equal(stored.result.claudeSessionId, loggedSessionId);
+  const indexEntry = withPluginData(rt.dataDir, () => listJobs(rt.repoDir)).find((job) => job.id === jobId);
+  assert.equal(indexEntry.claudeSessionId, loggedSessionId);
+
+  // The fake crashes again, but the resumed invocation targets the session.
+  runCompanion(rt, ["task", "--json", "--continue", "try again"]);
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 2);
+  assert.equal(invocations[1].resume, loggedSessionId);
+});
+
+test("the background worker rebuilds permissions from the profile name and rejects tampered requests", () => {
+  const rt = setupRuntime("ok");
+  const seed = (jobId, requestPatch) =>
+    withPluginData(rt.dataDir, () => {
+      const logFile = resolveJobLogFile(rt.repoDir, jobId);
+      fs.writeFileSync(logFile, "", "utf8");
+      const record = {
+        id: jobId,
+        kind: "task",
+        kindLabel: "rescue",
+        title: "NanoGPT Task",
+        jobClass: "task",
+        status: "queued",
+        phase: "queued",
+        workspaceRoot: rt.repoDir,
+        logFile,
+        createdAt: new Date().toISOString(),
+        request: { cwd: rt.repoDir, model: "z-ai/glm-5.2", prompt: "Tampered", profile: "read", bashAllow: [], jobId, ...requestPatch }
+      };
+      writeJobFile(rt.repoDir, jobId, record);
+      upsertJob(rt.repoDir, record);
+    });
+
+  // A ready-made profile object smuggling Bash into a "read" run.
+  seed("task-tampered-profile", {
+    profile: { name: "read", tools: ["Read", "Bash"], allowedTools: ["Read", "Bash"], bashAllow: [] }
+  });
+  const byObject = runCompanion(rt, ["task-worker", "--cwd", rt.repoDir, "--job-id", "task-tampered-profile"]);
+  assert.notEqual(byObject.status, 0);
+  assert.match(byObject.stderr, /Invalid permission profile/);
+
+  // A Bash prefix that tries to break out of its Bash(<prefix>:*) rule.
+  seed("task-tampered-bash", { profile: "write", bashAllow: ["git status:*),Bash(rm"] });
+  const byPrefix = runCompanion(rt, ["task-worker", "--cwd", rt.repoDir, "--job-id", "task-tampered-bash"]);
+  assert.notEqual(byPrefix.status, 0);
+  assert.match(byPrefix.stderr, /Invalid Bash allowlist prefix/);
+
+  assert.equal(readInvocations(rt.invocationsLog).length, 0);
+  const jobs = withPluginData(rt.dataDir, () => listJobs(rt.repoDir));
+  for (const id of ["task-tampered-profile", "task-tampered-bash"]) {
+    assert.equal(jobs.find((job) => job.id === id).status, "failed");
+  }
 });
 
 // --- status / result / cancel -------------------------------------------------

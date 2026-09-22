@@ -336,6 +336,27 @@ test("setup --disallow-bash 'npm test' removes it from config", async () => {
   }
 });
 
+test("setup --disallow-bash with two prefixes removes both", async () => {
+  const server = await startFakeServer();
+  try {
+    const rt = setupRuntime({ server });
+    withPluginData(rt.dataDir, () => setConfig(rt.repoDir, "bashAllow", ["npm test", "make", "cargo test"]));
+
+    const setupResult = runCompanion(rt, ["setup", "--json", "--disallow-bash", "npm test", "--disallow-bash", "make"]);
+    assert.equal(setupResult.status, 0, setupResult.stderr);
+    const payload = JSON.parse(setupResult.stdout);
+    assert.ok(payload.actionsTaken.some((a) => /Removed Bash prefix: npm test/.test(a)));
+    assert.ok(payload.actionsTaken.some((a) => /Removed Bash prefix: make/.test(a)));
+    assert.equal(payload.bashAllow.includes("npm test"), false);
+    assert.equal(payload.bashAllow.includes("make"), false);
+
+    const stored = withPluginData(rt.dataDir, () => getConfig(rt.repoDir));
+    assert.deepEqual(stored.bashAllow, ["cargo test"]);
+  } finally {
+    server.child.kill();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // --disallow-bash ls reports built-in defaults can't be removed
 // ---------------------------------------------------------------------------
@@ -375,10 +396,10 @@ test("package.json with a test script -> nextSteps suggests the allow-bash comma
     const first = runCompanion(rt, ["setup", "--json"]);
     assert.equal(first.status, 0, first.stderr);
     const firstPayload = JSON.parse(first.stdout);
-    assert.ok(
-      firstPayload.nextSteps.some((s) => s.includes('/nano:setup --allow-bash "npm test"')),
-      `expected the allow-bash suggestion: ${JSON.stringify(firstPayload.nextSteps)}`
-    );
+    const suggestion = firstPayload.nextSteps.find((s) => s.includes('/nano:setup --allow-bash "npm test"'));
+    assert.ok(suggestion, `expected the allow-bash suggestion: ${JSON.stringify(firstPayload.nextSteps)}`);
+    // Allowlisting a test runner lets the model run code it writes: say so.
+    assert.match(suggestion, /risk: .*run any code/);
 
     // After allowlisting npm test, the suggestion should disappear.
     const second = runCompanion(rt, ["setup", "--json", "--allow-bash", "npm test"]);

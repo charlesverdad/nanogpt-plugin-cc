@@ -22,6 +22,8 @@ If Claude Code is missing or too old:
 
 The `--model` option accepts a model id or alias (`default`, `heavy`, `alt`, `fast`) and stores the resolved model as the workspace default.
 
-`--allow-bash <prefix>` (repeatable) adds a Bash command prefix to the workspace allowlist; `--disallow-bash <prefix>` (repeatable) removes one. Built-in defaults cannot be removed.
+`--allow-bash <prefix>` (repeatable) adds a Bash command prefix to the workspace allowlist; `--disallow-bash <prefix>` (repeatable) removes one. The built-in defaults are `git status` and `ls`, and they cannot be removed.
+
+When presenting the allowlist or a suggestion to extend it, pass on this risk: an allowlisted prefix runs with any arguments and the user's permissions. Any command that runs repository code (test runners, build tools, package scripts such as `npm test`) or takes an output-file option lets the NanoGPT model write or execute anything, because it can edit that code or config first. Only Edit/Write are confined to the working directory and kept out of `.git`.
 
 The stop-time review gate is optional and off by default. Pass `--enable-review-gate` to require a fresh NanoGPT review before a session can stop, or `--disable-review-gate` to turn it back off.

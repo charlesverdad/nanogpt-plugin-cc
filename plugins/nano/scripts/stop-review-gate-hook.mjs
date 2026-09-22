@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 
-import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { readStdinSync } from "./lib/fs.mjs";
 import { getClaudeAvailability, resolveApiKey } from "./lib/runtime.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
-import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
+import { JOB_ORIGIN_ENV, SESSION_ID_ENV, STOP_GATE_ORIGIN } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
@@ -18,7 +18,8 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
+  // The hook input carries Claude's last message, which can be large.
+  const raw = readStdinSync().trim();
   if (!raw) {
     return {};
   }
@@ -106,11 +107,17 @@ function runStopReview(cwd, input = {}) {
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
+    // Marks the job as a gate review so `task --continue` skips it.
+    [JOB_ORIGIN_ENV]: STOP_GATE_ORIGIN,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--read-only", prompt], {
+  // The prompt embeds Claude's last message, which can exceed the per-argument
+  // argv limit, so it goes through stdin (task reads stdin when no positional
+  // prompt is given).
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--read-only"], {
     cwd,
     env: childEnv,
+    input: prompt,
     encoding: "utf8",
     timeout: STOP_REVIEW_TIMEOUT_MS
   });

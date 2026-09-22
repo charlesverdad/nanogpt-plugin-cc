@@ -8,11 +8,11 @@
 
 import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
 import { binaryAvailable, runCommand } from "./process.mjs";
+import { ensurePrivateDir, resolveFallbackDataDir } from "./state.mjs";
 
 export const DEFAULT_BASE_URL = "https://nano-gpt.com/api";
 export const KEYCHAIN_SERVICE = "nanogpt-api-key";
@@ -28,11 +28,17 @@ export const STRIPPED_ENV_VARS = Object.freeze([
   "ANTHROPIC_SMALL_FAST_MODEL",
   "CLAUDE_CODE_USE_BEDROCK",
   "CLAUDE_CODE_USE_VERTEX",
-  "CLAUDE_CODE_USE_FOUNDRY"
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_SUBAGENT_MODEL"
 ]);
 
 export const READ_TOOLS = Object.freeze(["Read", "Glob", "Grep"]);
-export const DEFAULT_BASH_ALLOW = Object.freeze(["git status", "git diff", "git log", "git show", "ls"]);
+// Only commands none of whose options can write a file or run repo code: an
+// allowlisted prefix runs with any arguments.
+// `git diff`/`git log`/`git show` are deliberately absent: their `--output=<file>`
+// option writes anywhere (including `.git/config`), which Claude Code's Bash
+// path checks do not catch.
+export const DEFAULT_BASH_ALLOW = Object.freeze(["git status", "ls"]);
 export const PROFILES = Object.freeze(["read", "write"]);
 export const OUTPUT_FORMATS = Object.freeze(["json", "stream-json"]);
 
@@ -248,9 +254,18 @@ export function buildClaudeArgs({
 // Prompt sizing / inline rendering helpers
 // ---------------------------------------------------------------------------
 
-// Upper bound on a single argv prompt entry. Prompts at or above this must be
-// piped through stdin instead of passed on the command line.
-export const PROMPT_ARGV_LIMIT = 100000;
+// Upper bound, in UTF-8 bytes, on a prompt passed as a single argv entry
+// (Linux caps one argument at 128 KiB). Larger prompts are piped through stdin.
+export const PROMPT_ARGV_LIMIT = 64 * 1024;
+
+/**
+ * True when the prompt must go to claude's stdin rather than argv: always on
+ * Windows (spawn goes through a shell there, so argv text would be parsed by
+ * cmd.exe), otherwise when it exceeds PROMPT_ARGV_LIMIT bytes.
+ */
+export function shouldSendPromptViaStdin(prompt, platform = process.platform) {
+  return platform === "win32" || Buffer.byteLength(String(prompt ?? ""), "utf8") > PROMPT_ARGV_LIMIT;
+}
 
 // Default cap for inline (in-rendered-message) result output, overridable via
 // NANO_MAX_INLINE_CHARS.
@@ -303,7 +318,7 @@ export function parseClaudeJsonOutput(stdout) {
   }
   try {
     const whole = JSON.parse(trimmed);
-    if (whole !== null && typeof whole === "object" && !Array.isArray(whole)) {
+    if (whole !== null && typeof whole === "object" && !Array.isArray(whole) && whole.type === "result") {
       return whole;
     }
   } catch {
@@ -443,7 +458,7 @@ export function summarizeClaudeResult(result) {
 // ---------------------------------------------------------------------------
 
 export function resolveRunLogFile(env = process.env) {
-  return path.join(env.CLAUDE_PLUGIN_DATA || path.join(os.tmpdir(), "nano-companion"), "runs.jsonl");
+  return path.join(env.CLAUDE_PLUGIN_DATA || resolveFallbackDataDir(), "runs.jsonl");
 }
 
 export function buildRunLogEntry({ model, cwd, allowedTools = [], task = "", summary, now = new Date() }) {
@@ -470,8 +485,13 @@ export function buildRunLogEntry({ model, cwd, allowedTools = [], task = "", sum
  */
 export function appendRunLog(entry, options = {}) {
   try {
-    const file = resolveRunLogFile(options.env ?? process.env);
-    mkdirSync(path.dirname(file), { recursive: true });
+    const env = options.env ?? process.env;
+    const file = resolveRunLogFile(env);
+    if (env.CLAUDE_PLUGIN_DATA) {
+      mkdirSync(path.dirname(file), { recursive: true });
+    } else {
+      ensurePrivateDir(path.dirname(file));
+    }
     appendFileSync(file, JSON.stringify(entry) + "\n");
     return file;
   } catch {

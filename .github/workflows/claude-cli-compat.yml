@@ -7,7 +7,8 @@ name: claude-cli compat
 #
 # The offline contract test (tests/cli-contract.test.mjs) runs in the normal
 # CI workflow; this workflow exercises the SAME manifest against REAL installed
-# Claude Code versions via plugins/nano/scripts/check-cli-contract.mjs.
+# Claude Code versions via plugins/nano/scripts/check-cli-contract.mjs. It also
+# runs the offline permission-boundary regression test against each version.
 
 on:
   # Re-validate whenever the manifest or contract code changes.
@@ -17,6 +18,8 @@ on:
       - "plugins/nano/scripts/check-cli-contract.mjs"
       - "plugins/nano/scripts/lib/runtime.mjs"
       - "tests/cli-contract.test.mjs"
+      - "tests/real-claude-boundary.test.mjs"
+      - "tests/fake-anthropic-server.mjs"
       - ".github/workflows/claude-cli-compat.yml"
   # Catch upstream Claude Code releases that break us.
   schedule:
@@ -71,3 +74,12 @@ jobs:
 
       - name: Verify plugin command contract against installed Claude Code
         run: node plugins/nano/scripts/check-cli-contract.mjs
+
+      # Drives the installed claude with the default `write` profile against a
+      # scripted fake Anthropic endpoint (offline, fake key, $0) and checks the
+      # permission boundary: git --output escapes, writes outside cwd and .git
+      # edits are denied; git status and ls still run.
+      - name: Permission boundary regression (real claude, fake endpoint)
+        env:
+          NANO_REAL_CLAUDE: "1"
+        run: node --test tests/real-claude-boundary.test.mjs
