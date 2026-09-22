@@ -20,5 +20,5 @@ The stop-time review gate is optional and off by default. Pass
 `--enable-review-gate` to require a fresh NanoGPT review before a session can stop,
 or `--disable-review-gate` to turn it back off.
 
-Output rules:
+Presenting the result:
 - Present the final setup output to the user.
