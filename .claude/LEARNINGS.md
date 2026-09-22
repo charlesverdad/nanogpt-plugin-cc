@@ -17,3 +17,5 @@
 - Tests that unset NANOGPT_API_KEY must shadow `security`/`secret-tool` on PATH, or the real keychain key is picked up on dev machines.
 - Tests run the companion with spawnSync, which blocks the event loop, so fake HTTP servers must run in a child process.
 - The rtk hook filters `ps` output; use `rtk proxy ps` to see processes.
+- A Claude Code `Bash(<prefix>:*)` rule allows the prefix with any arguments, and its path checks don't understand per-command options: `git diff/log/show --output=<file>` wrote outside cwd and into `.git/config` (then `core.fsmonitor` ran on `git status`). Never allowlist commands that take an output-file flag or run repo code unless the user accepts full execution.
+- To test permission boundaries offline, point the real `claude` at a scripted fake Anthropic endpoint (`tests/fake-anthropic-server.mjs`) with a fake key and `CLAUDE_CONFIG_DIR` set to a temp dir: a whole run takes under a second and costs nothing.

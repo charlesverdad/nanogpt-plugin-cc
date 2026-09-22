@@ -6,7 +6,7 @@ This plugin is for Claude Code users who have a NanoGPT subscription and want to
 
 ## How It Works
 
-A Claude Code plugin subagent shares the parent's API endpoint, so it cannot run on a non-Anthropic model in-process. Instead, this plugin spawns Claude Code itself headless (`claude -p --restricted ...`) with `ANTHROPIC_BASE_URL` pointed at NanoGPT's Anthropic-compatible endpoint. The NanoGPT model then runs as a restricted, sandboxed child process with an explicit tool allowlist. A companion script (`nano-companion.mjs`) handles job management, output rendering, and session resume.
+A Claude Code plugin subagent shares the parent's API endpoint, so it cannot run on a non-Anthropic model in-process. Instead, this plugin spawns Claude Code itself headless (`claude -p --restricted ...`) with `ANTHROPIC_BASE_URL` pointed at NanoGPT's Anthropic-compatible endpoint. The NanoGPT model then runs as a restricted child process with an explicit tool allowlist (see [Permission Profiles](#permission-profiles) for exactly what that does and does not confine). A companion script (`nano-companion.mjs`) handles job management, output rendering, and session resume.
 
 ## Requirements
 
@@ -95,7 +95,7 @@ Hands a task to NanoGPT through the `nano:nano-rescue` subagent. Use it to inves
 - `--model <id|alias>` — select a model by id or alias (see Models below). If omitted, the workspace default is used.
 - `--thinking` — use the `:thinking` variant of the selected model when it exists.
 - `--read-only` — run with the `read` permission profile (no Edit, Write, or Bash).
-- `--allow-bash <prefix>` — add a Bash prefix to the allowlist for this run (repeatable).
+- `--allow-bash <prefix>` — add a Bash prefix to the allowlist for this run (repeatable). The command then runs with any arguments; see [Permission Profiles](#permission-profiles) for the risk.
 - `--allow-paid` — allow a non-subscription (pay-per-token) model. Refused otherwise.
 
 Examples:
@@ -133,7 +133,7 @@ Runs a steerable review that questions the chosen implementation, design tradeof
 Checks readiness and optionally configures workspace defaults.
 
 - `--model <id|alias>` — set the workspace default model.
-- `--allow-bash <prefix>` — add a Bash prefix to the workspace allowlist (repeatable).
+- `--allow-bash <prefix>` — add a Bash prefix to the workspace allowlist (repeatable). A prefix that runs repo code (e.g. `npm test`) lets the model execute anything; see [Permission Profiles](#permission-profiles).
 - `--disallow-bash <prefix>` — remove a Bash prefix from the workspace allowlist (repeatable).
 - `--enable-review-gate` / `--disable-review-gate` — toggle the stop-time review gate, which requires a fresh NanoGPT review before a session can stop. Off by default.
 
@@ -184,11 +184,17 @@ The headless child runs under `--restricted`, which ignores your user/project se
 | `read` | `review`, `adversarial-review`, the stop gate, `rescue --read-only` | Read, Glob, Grep | Read, Glob, Grep |
 | `write` | `rescue` (default) | Read, Glob, Grep, Edit, Write, Bash | Read, Glob, Grep, Edit (`./**`), Write (`./**`), Bash (allowlisted prefixes only) |
 
-The default Bash allowlist for the `write` profile is: `git status`, `git diff`, `git log`, `git show`, `ls`. If the allowlist is empty, Bash is dropped from the toolset entirely.
+The default Bash allowlist for the `write` profile is: `git status`, `ls`. If the allowlist is empty, Bash is dropped from the toolset entirely.
 
-`--restricted` blocks writes to settings files and `.git`. File edits are confined to the working directory. Shell compound commands (`&&`), command substitutions (`$(...)`), pipes, and redirects outside the workspace are denied under the prefix rules — these were verified live.
+What is and is not confined:
 
-Rather than widening the defaults, add your test command per workspace. For example:
+- **Edit and Write** are confined to the working directory, and `--restricted` blocks them from touching `.git` and settings files.
+- **Bash** is only limited by the allowlist. An allowlisted prefix runs with **any arguments**, with your user's permissions. Claude Code denies shell compound commands (`&&`), command substitutions (`$(...)`), pipes and redirects outside the workspace under the prefix rules (verified live), but it does not understand each command's own options.
+- `git diff`, `git log` and `git show` are deliberately **not** default: their `--output=<file>` option writes anywhere, including `.git/config` (e.g. a `core.fsmonitor` command that the next `git status` runs). `tests/real-claude-boundary.test.mjs` guards this.
+
+**Risk of extending the allowlist:** any allowlisted command that runs repository code (test runners, build tools, package scripts such as `npm test`, `make`, `cargo test`) or takes an output-file option lets the NanoGPT model write or execute anything your user can, because it can first edit the code or config that command runs. Only allowlist such commands for repositories and tasks where you accept that, or use `--read-only`.
+
+With that in mind, add your test command per workspace rather than widening the defaults. For example:
 
 ```
 /nano:setup --allow-bash "npm test"
@@ -250,7 +256,7 @@ When tool calls were denied, the footer ends with `denied=` and the denied tool 
 | `session` | The Claude Code session id (used by `--continue` to resume). |
 | `denied` | Present only when tool calls were denied. Lists the denied tool and detail, e.g. `Bash(rm -rf build)`. Rerun with `--allow-bash` to grant the command. |
 
-Run metrics are appended as one JSON line per run to `${CLAUDE_PLUGIN_DATA}/runs.jsonl` (falling back to `$TMPDIR/nano-companion/runs.jsonl`).
+Run metrics are appended as one JSON line per run to `${CLAUDE_PLUGIN_DATA}/runs.jsonl` (falling back to `$TMPDIR/nano-companion-<uid>/runs.jsonl`, a per-user directory kept at mode 0700; job state and the model catalog cache use the same fallback).
 
 ## Calling the Companion Directly
 

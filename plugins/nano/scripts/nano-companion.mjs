@@ -50,12 +50,12 @@ import {
   parseClaudeJsonOutput,
   parseStreamEvent,
   parseClaudeVersion,
-  PROMPT_ARGV_LIMIT,
   requireApiKey,
   resolveApiKey,
   resolveBaseUrl,
   resolveMaxInlineChars,
   runClaude,
+  shouldSendPromptViaStdin,
   summarizeClaudeResult
 } from "./lib/runtime.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -65,9 +65,11 @@ import {
   createJobLogFile,
   createJobRecord,
   createProgressReporter,
+  JOB_ORIGIN_ENV,
   nowIso,
   runTrackedJob,
-  SESSION_ID_ENV
+  SESSION_ID_ENV,
+  STOP_GATE_ORIGIN
 } from "./lib/tracked-jobs.mjs";
 import {
   generateJobId,
@@ -429,7 +431,9 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   }
   const testSuggestion = detectTestCommandSuggestion(workspaceRoot, bashAllow);
   if (testSuggestion) {
-    nextSteps.push(`Allow the project test command: ${testSuggestion.command}`);
+    nextSteps.push(
+      `Allow the project test command: ${testSuggestion.command} (risk: NanoGPT can then run any code it writes into the tests or build files)`
+    );
   }
   if (apiKey && claudeAvailability.available && !reviewGateEnabled) {
     nextSteps.push("Optional: run `/nano:setup --enable-review-gate` to require a fresh review before stop.");
@@ -507,7 +511,7 @@ async function handleSetup(argv) {
   // --disallow-bash <prefix> (repeatable): remove from config.bashAllow.
   if (options["disallow-bash"]) {
     const currentConfig = getConfig(workspaceRoot);
-    const currentList = Array.isArray(currentConfig.bashAllow) ? currentConfig.bashAllow : [];
+    let currentList = Array.isArray(currentConfig.bashAllow) ? currentConfig.bashAllow : [];
     for (const rawPrefix of options["disallow-bash"]) {
       const [normalized] = normalizeBashAllow([rawPrefix]);
       const prefix = normalized ?? String(rawPrefix).trim();
@@ -519,7 +523,8 @@ async function handleSetup(argv) {
         actionsTaken.push(`Bash prefix "${prefix}" was not present in the allowlist.`);
         continue;
       }
-      setConfig(workspaceRoot, "bashAllow", currentList.filter((p) => p !== prefix));
+      currentList = currentList.filter((p) => p !== prefix);
+      setConfig(workspaceRoot, "bashAllow", currentList);
       actionsTaken.push(`Removed Bash prefix: ${prefix}`);
     }
   }
@@ -533,8 +538,12 @@ async function handleSetup(argv) {
 // ---------------------------------------------------------------------------
 
 /**
- * request = { cwd, prompt, model, profile ("read"|"write"|profile object),
- *   bashAllow, resumeSessionId, streaming, onProgress, onSession }
+ * request = { cwd, prompt, model, profile ("read"|"write"), bashAllow,
+ *   resumeSessionId, streaming, onProgress, onSession }
+ *
+ * The permission profile is always rebuilt here from its name and the Bash
+ * allowlist (validated by normalizeBashAllow); a ready-made tools/allowedTools
+ * object, e.g. from a tampered job file, is rejected.
  *
  * The API key is resolved fresh here (never taken from `request`), so a
  * queued background job's stored request never contains it. Returns
@@ -545,8 +554,8 @@ async function handleSetup(argv) {
  * With `streaming` the run uses `--output-format stream-json --verbose` and
  * each stdout line is fed to parseStreamEvent: progress strings are passed to
  * `onProgress` (so they land in the job log) and the first session id seen is
- * passed to `onSession`. The final summary still comes from the last
- * `type: "result"` line via parseClaudeJsonOutput.
+ * passed to `onSession` and returned as `streamSessionId`. The final summary
+ * still comes from the last `type: "result"` line via parseClaudeJsonOutput.
  */
 async function executeClaudeRun({
   cwd,
@@ -559,11 +568,17 @@ async function executeClaudeRun({
   onProgress = null,
   onSession = null
 }) {
-  const permissions = typeof profile === "object" && profile !== null ? profile : buildPermissionProfile(profile, { bashAllow });
+  if (typeof profile !== "string") {
+    throw new Error('Invalid permission profile: expected "read" or "write".');
+  }
+  if (bashAllow != null && !Array.isArray(bashAllow)) {
+    throw new Error("Invalid Bash allowlist: expected a list of command prefixes.");
+  }
+  const permissions = buildPermissionProfile(profile, { bashAllow });
 
   const { key: apiKey } = requireApiKey();
   const env = buildChildEnv({ apiKey, model, baseUrl: resolveBaseUrl() });
-  const promptViaStdin = prompt.length > PROMPT_ARGV_LIMIT;
+  const promptViaStdin = shouldSendPromptViaStdin(prompt);
   const args = buildClaudeArgs({
     prompt,
     model,
@@ -577,15 +592,15 @@ async function executeClaudeRun({
     onProgress(`Running NanoGPT (${model}, profile=${permissions.name})...`);
   }
 
-  let sessionIdSeen = false;
+  let streamSessionId = null;
   const onStdoutLine = streaming
     ? (line) => {
         const event = parseStreamEvent(line, { cwd });
         if (!event) {
           return;
         }
-        if (event.sessionId && !sessionIdSeen) {
-          sessionIdSeen = true;
+        if (event.sessionId && !streamSessionId) {
+          streamSessionId = event.sessionId;
           if (typeof onSession === "function") {
             onSession(event.sessionId);
           }
@@ -630,6 +645,7 @@ async function executeClaudeRun({
   return {
     exitStatus,
     summary,
+    streamSessionId,
     permissions,
     model,
     stderr: result.stderr,
@@ -759,7 +775,9 @@ async function executeTaskRun(request) {
     status: run.exitStatus,
     isError: run.summary ? run.summary.isError : true,
     rawOutput: run.summary ? run.summary.text : "",
-    claudeSessionId: run.summary?.sessionId ?? null,
+    // A run that died after its stream reported a session (no result object)
+    // is still resumable; keep that id rather than null.
+    claudeSessionId: run.summary?.sessionId ?? run.streamSessionId ?? null,
     model: run.model,
     profile: run.permissions.name,
     bashAllow: run.permissions.bashAllow,
@@ -785,7 +803,8 @@ async function executeTaskRun(request) {
     jobClass: "task",
     write: run.permissions.name === "write",
     jobPatch: {
-      claudeSessionId: payload.claudeSessionId,
+      // Never overwrite a session id recorded earlier (worker onSession) with null.
+      ...(payload.claudeSessionId ? { claudeSessionId: payload.claudeSessionId } : {}),
       model: run.model,
       profile: run.permissions.name,
       bashAllow: run.permissions.bashAllow,
@@ -846,8 +865,8 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
-  return createCompanionJob({
+function buildTaskJob(workspaceRoot, taskMetadata, write, origin = null) {
+  const job = createCompanionJob({
     prefix: "task",
     kind: "task",
     title: taskMetadata.title,
@@ -856,6 +875,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     summary: taskMetadata.summary,
     write
   });
+  return origin ? { ...job, origin } : job;
 }
 
 function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId, warnings }) {
@@ -985,15 +1005,17 @@ async function handleReview(argv) {
 }
 
 // Find the newest finished `task` job for the current Claude session (or, if
-// no session id is set, the newest finished task job overall). Shared by the
-// `task-resume-candidate` subcommand and `task --continue`.
+// no session id is set, the newest finished task job overall). Stop-gate
+// review runs are skipped: they are read-only reviews, not the user's rescue
+// work. Shared by the `task-resume-candidate` subcommand and `task --continue`.
 function resolveTaskResumeCandidate(workspaceRoot) {
   const sessionId = process.env[SESSION_ID_ENV] ?? null;
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const visibleJobs = sessionId ? jobs.filter((job) => job.sessionId === sessionId) : jobs;
 
   const indexEntry = visibleJobs.find(
-    (job) => job.jobClass === "task" && job.status !== "queued" && job.status !== "running"
+    (job) =>
+      job.jobClass === "task" && job.origin !== STOP_GATE_ORIGIN && job.status !== "queued" && job.status !== "running"
   ) ?? null;
 
   if (!indexEntry) {
@@ -1041,6 +1063,7 @@ async function handleTask(argv) {
   const thinking = Boolean(options.thinking);
   const allowPaid = Boolean(options["allow-paid"]);
   const readOnly = Boolean(options["read-only"]);
+  const origin = process.env[JOB_ORIGIN_ENV] === STOP_GATE_ORIGIN ? STOP_GATE_ORIGIN : null;
 
   let prompt = readTaskPrompt(invocationCwd, options, positionals);
   let cwd = invocationCwd;
@@ -1088,14 +1111,14 @@ async function handleTask(argv) {
 
   if (options.background) {
     ensureClaudeAvailable(cwd);
-    const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write");
+    const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write", origin);
     const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id, warnings });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write");
+  const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write", origin);
   await runForegroundCommand(
     job,
     (progress) =>
@@ -1146,9 +1169,11 @@ async function handleTaskWorker(argv) {
   );
 
   // Persist the Claude session id into the stored job as soon as the stream
-  // reports it, so `task --continue` works for a still-running (or cancelled)
-  // job, not just a finished one. The API key is never on this path: it is
-  // resolved inside executeClaudeRun and not part of the stored request.
+  // reports it, so a job that is cancelled or dies before claude prints its
+  // result can still be resumed with `task --continue` once it has stopped
+  // (running jobs are never resume candidates). The API key is never on this
+  // path: it is resolved inside executeClaudeRun and not part of the stored
+  // request.
   const onSession = (claudeSessionId) => {
     writeJobFile(workspaceRoot, storedJob.id, {
       ...readStoredJob(workspaceRoot, storedJob.id),

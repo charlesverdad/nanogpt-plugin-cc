@@ -7,13 +7,50 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
-const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "nano-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function currentUserTag() {
+  if (typeof process.getuid === "function") {
+    return String(process.getuid());
+  }
+  try {
+    return os.userInfo().username.replace(/[^a-zA-Z0-9._-]+/g, "-") || "user";
+  } catch {
+    return "user";
+  }
+}
+
+/**
+ * Per-user data dir used when CLAUDE_PLUGIN_DATA is unset. os.tmpdir() is
+ * shared between users on Linux, so the name carries the uid and the dir is
+ * kept private (see ensurePrivateDir).
+ */
+export function resolveFallbackDataDir() {
+  return path.join(os.tmpdir(), `nano-companion-${currentUserTag()}`);
+}
+
+/**
+ * Create `dir` with mode 0o700 if needed and refuse to use it unless it is a
+ * real directory owned by the current user, so another local user cannot
+ * pre-create it to read or plant job, config or cache files.
+ */
+export function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(dir);
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (!stat.isDirectory() || (uid !== null && stat.uid !== uid)) {
+    throw new Error(`Refusing to use ${dir}: it is not a directory owned by the current user. Remove it or set CLAUDE_PLUGIN_DATA.`);
+  }
+  if (uid !== null && (stat.mode & 0o077) !== 0) {
+    fs.chmodSync(dir, 0o700);
+  }
+  return dir;
 }
 
 function defaultState() {
@@ -37,7 +74,7 @@ export function resolveStateDir(cwd) {
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
   const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : path.join(ensurePrivateDir(resolveFallbackDataDir()), "state");
   return path.join(stateRoot, `${slug}-${hash}`);
 }
 

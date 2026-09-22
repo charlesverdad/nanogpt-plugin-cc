@@ -26,6 +26,9 @@ export const FAKE_API_KEY = "nano-test-key-DO-NOT-LEAK-7f3a";
  *   - "no-json"   print `this is not json` to stdout, exit 1.
  *   - "long"      like "ok" but result is 20000 "L" characters, exit 0.
  *   - "slow"      wait options.delayMs then behave like "ok".
+ *   - "crash-after-init"  stream-json: print the init and one assistant
+ *                 tool_use line, then exit 1 with NO result object (json:
+ *                 print nothing, exit 1). Simulates claude dying mid-run.
  *
  * Each run-mode invocation appends ONE JSON line to
  * `<binDir>/claude-invocations.log` recording the argv it received and decoded
@@ -53,6 +56,34 @@ const DELAY_MS = ${JSON.stringify(delayMs)};
 const INVOCATIONS_LOG = ${JSON.stringify(invocationsLog)};
 
 const argv = process.argv.slice(2);
+
+// fs.readFileSync(0) throws EAGAIN on a non-blocking pipe whose writer has not
+// finished (large prompts), so read in a loop.
+function readAllStdin() {
+  const chunks = [];
+  const buffer = Buffer.alloc(65536);
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    let n;
+    try {
+      n = fs.readSync(0, buffer, 0, buffer.length, null);
+    } catch (error) {
+      if (error && error.code === "EAGAIN") {
+        Atomics.wait(pause, 0, 0, 5);
+        continue;
+      }
+      if (error && error.code === "EOF") {
+        break;
+      }
+      throw error;
+    }
+    if (n === 0) {
+      break;
+    }
+    chunks.push(Buffer.from(buffer.subarray(0, n)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 // --- --version / --help -----------------------------------------------------
 
@@ -161,7 +192,7 @@ function parseRunArgs(args) {
   }
   if (parsed.prompt === null && !sawDashDash) {
     try {
-      parsed.prompt = fs.readFileSync(0, "utf8");
+      parsed.prompt = readAllStdin();
     } catch (e) {
       parsed.prompt = "";
     }
@@ -345,7 +376,17 @@ function finish() {
   process.exit(exitCode);
 }
 
-if (BEHAVIOR === "slow" && run.outputFormat === "stream-json") {
+if (BEHAVIOR === "crash-after-init") {
+  recordInvocation();
+  if (run.outputFormat === "stream-json") {
+    process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: run.model, cwd: process.cwd() }) + "\\n");
+    process.stdout.write(JSON.stringify({ type: "assistant", session_id: sessionId, message: { role: "assistant", content: [
+      { type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: process.cwd() + "/README.md" } }
+    ] } }) + "\\n");
+  }
+  process.stderr.write("fake claude: crashed\\n");
+  process.exit(1);
+} else if (BEHAVIOR === "slow" && run.outputFormat === "stream-json") {
   // Record the invocation (including pid) and print the init line BEFORE
   // waiting, so tests can observe and cancel the still-running process.
   recordInvocation();

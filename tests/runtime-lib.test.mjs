@@ -215,6 +215,16 @@ test("buildChildEnv: removes every STRIPPED_ENV_VARS name", () => {
   assert.equal(env.PATH, "/usr/bin:/bin");
 });
 
+test("STRIPPED_ENV_VARS covers the subagent model override", () => {
+  assert.ok(STRIPPED_ENV_VARS.includes("CLAUDE_CODE_SUBAGENT_MODEL"));
+  const env = buildChildEnv({ baseEnv: { CLAUDE_CODE_SUBAGENT_MODEL: "opus" }, apiKey: "K", model: "m", baseUrl: "https://x/api" });
+  assert.equal("CLAUDE_CODE_SUBAGENT_MODEL" in env, false);
+});
+
+test("DEFAULT_BASH_ALLOW excludes git commands that take --output=<file>", () => {
+  assert.deepEqual([...DEFAULT_BASH_ALLOW], ["git status", "ls"]);
+});
+
 test("buildChildEnv: sets all expected vars", () => {
   const env = buildChildEnv({ baseEnv: { PATH: "/bin" }, apiKey: "K", model: "glm-5.2", baseUrl: "https://x/api" });
   assert.equal(env.ANTHROPIC_BASE_URL, "https://x/api");
@@ -317,9 +327,6 @@ test('buildPermissionProfile: write with default allowlist', () => {
     "Edit(./**)",
     "Write(./**)",
     "Bash(git status:*)",
-    "Bash(git diff:*)",
-    "Bash(git log:*)",
-    "Bash(git show:*)",
     "Bash(ls:*)"
   ]);
   assert.deepEqual(p.bashAllow, [...DEFAULT_BASH_ALLOW]);
@@ -409,7 +416,7 @@ test("buildClaudeArgs: write profile tools/allowedTools strings", () => {
   const args = buildClaudeArgs({ prompt: "hi", model: "m", profile: "write" });
   assert.equal(args.some((a) => a === "--tools=Read,Glob,Grep,Edit,Write,Bash"), true);
   assert.equal(
-    args.some((a) => a === "--allowedTools=Read,Glob,Grep,Edit(./**),Write(./**),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(ls:*)"),
+    args.some((a) => a === "--allowedTools=Read,Glob,Grep,Edit(./**),Write(./**),Bash(git status:*),Bash(ls:*)"),
     true
   );
 });

@@ -167,6 +167,23 @@ test("Stop hook runs the review task with the read-only tool profile", () => {
   assert.equal(invocations[0].allowedTools, "Read,Glob,Grep");
 });
 
+test("Stop hook passes a very large last message to the review through stdin, not argv", () => {
+  const rt = setupRuntime({ behavior: "ok" });
+  enableGate(rt);
+  // Far above Linux's 128 KiB single-argument limit.
+  const bigMessage = `edited a file\n${"x".repeat(300 * 1024)}`;
+
+  const result = runStopHook(rt, { cwd: rt.repoDir, last_assistant_message: bigMessage });
+  assert.equal(result.status, 0, result.stderr);
+
+  const invocations = readInvocations(path.join(rt.binDir, "claude-invocations.log"));
+  assert.equal(invocations.length, 1);
+  assert.ok(invocations[0].prompt.includes(bigMessage), "the full message reaches claude");
+  // The companion piped the oversized prompt to claude's stdin as well.
+  assert.equal(invocations[0].argv.includes("--"), false);
+  assert.equal(invocations[0].tools, "Read,Glob,Grep");
+});
+
 test("Stop hook allows the session to stop when the review answers ALLOW", () => {
   const binDir = makeTempDir("claude-bin-");
   const dataDir = makeTempDir("claude-data-");

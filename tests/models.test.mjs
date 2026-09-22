@@ -152,9 +152,10 @@ test("resolveCatalogCacheFile honors CLAUDE_PLUGIN_DATA", () => {
   assert.equal(resolveCatalogCacheFile(env), path.join("/tmp/nano-data", "models-cache.json"));
 });
 
-test("resolveCatalogCacheFile falls back to tmpdir/nano-companion", () => {
+test("resolveCatalogCacheFile falls back to a per-user tmpdir/nano-companion-<uid>", () => {
   const file = resolveCatalogCacheFile({});
-  assert.equal(file, path.join(path.join(os.tmpdir(), "nano-companion"), "models-cache.json"));
+  const owner = typeof process.getuid === "function" ? String(process.getuid()) : os.userInfo().username;
+  assert.equal(file, path.join(os.tmpdir(), `nano-companion-${owner}`, "models-cache.json"));
 });
 
 // ---------------------------------------------------------------------------
