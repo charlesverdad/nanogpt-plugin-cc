@@ -6,7 +6,7 @@
 - Don't use `--permission-mode auto` in a NanoGPT child: its safety check runs on the NanoGPT model, fails closed and burns ~30k tokens per check. Use `dontAsk` with an allowlist.
 - Headless children don't see CLAUDE.md or the conversation (with `--restricted`), so tasks must be self-contained.
 - NanoGPT's raw `/v1/messages` `usage.cost` is the upstream price, not what you're billed: on 2026-09-22 `z-ai/glm-5.2` reported ~$0.00001 per ping with a $0 balance and `allowOverage: false`, and the tokens counted against the subscription quota. Don't use `cost == 0` to detect the subscription; use `GET {base}/subscription/v1/usage` (`active`, `weeklyInputTokens.remaining`).
-- The NanoGPT subscription quota counts cached input tokens the same as uncached ones (reported by the user on 2026-09-22). Multi-turn agent runs resend the whole context every turn and burn quota fast. Use NanoGPT for reviews and one-shot prompts, and hand long implementation runs to Kimi or a Sonnet subagent.
+- The NanoGPT subscription quota counts cached input tokens the same as uncached ones (reported by the user on 2026-09-22). Multi-turn agent runs resend the whole context every turn and burn quota fast. Use NanoGPT for reviews and one-shot prompts, and hand long implementation runs to a Sonnet subagent.
 - The authenticated `GET {base}/v1/models?detailed=true` includes `subscription.{included,inputTokenMultiplier}`; without `x-api-key` that field is missing.
 - `claude -p --output-format stream-json` requires `--verbose`. API errors still produce a result object with `is_error: true` but `subtype: "success"`, so check `is_error`.
 - A prompt starting with `-` is parsed as an option by `claude`; put the prompt after `--`.
@@ -23,4 +23,3 @@
 - `claude --max-turns` works in `-p` mode but is hidden from `claude --help`. At the cap, claude exits 1 with `subtype: "error_max_turns"`, `terminal_reason: "max_turns"`, an empty `result` and a session id you can resume. `claude <flag> --help` short-circuits, so check hidden flags by running `claude -p` against an unreachable base URL and looking for "unknown option" on stderr.
 - NanoGPT's `GET /subscription/v1/usage` updates right after a call: the before/after `weeklyInputTokens.used` delta equalled the run's input tokens.
 - Allowlisted Bash prefixes accept any arguments. `git diff`/`log`/`show --output=<file>` write anywhere, `.git/config` included, and Claude Code's path checks miss it. Test permission boundaries offline with real claude against a fake Anthropic endpoint (tests/real-claude-boundary.test.mjs).
-- The Kimi subscription has a 5-hour usage window that a large task can exhaust midway. Keep Kimi specs small, or commit the partial work and hand the rest to another agent.

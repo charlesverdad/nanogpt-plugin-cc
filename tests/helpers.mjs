@@ -4,7 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
-export function makeTempDir(prefix = "kimi-plugin-test-") {
+export function makeTempDir(prefix = "nano-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
@@ -25,7 +25,7 @@ export function run(command, args, options = {}) {
 
 export function initGitRepo(cwd) {
   run("git", ["init", "-b", "main"], { cwd });
-  run("git", ["config", "user.name", "Kimi Plugin Tests"], { cwd });
+  run("git", ["config", "user.name", "Nano Plugin Tests"], { cwd });
   run("git", ["config", "user.email", "tests@example.com"], { cwd });
   run("git", ["config", "commit.gpgsign", "false"], { cwd });
   run("git", ["config", "tag.gpgsign", "false"], { cwd });

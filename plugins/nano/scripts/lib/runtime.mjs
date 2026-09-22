@@ -4,7 +4,7 @@
 // spawns `claude -p` with ANTHROPIC_BASE_URL pointed at NanoGPT's
 // Anthropic-compatible endpoint, and restricts what the child may do with
 // `--restricted`, `--tools`, `--allowedTools` and `--permission-mode dontAsk`.
-// See HANDOVER.md §2 for the verified runtime facts behind each flag.
+// See .claude/LEARNINGS.md for the verified runtime facts behind each flag.
 
 import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";

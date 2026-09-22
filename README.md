@@ -2,7 +2,7 @@
 
 Use NanoGPT subscription models from inside Claude Code for code reviews or to delegate tasks.
 
-This plugin is for Claude Code users who have a NanoGPT subscription and want to push well-scoped work — bug investigations, mechanical fixes, code reviews — onto subscription-included open-weight models (GLM, DeepSeek, Qwen, MiniMax, and others) from the workflow they already have. Calls to subscription-included models are included in the subscription, but every call counts against a weekly input-token quota, cached input included. `/nano:rescue` only ever runs when you explicitly ask for it (via the command or by telling Claude to hand work to NanoGPT); Claude does not reach for it on its own. The UX mirrors the kimi and codex plugins: slash commands, background jobs, and a thin forwarding subagent.
+This plugin is for Claude Code users who have a NanoGPT subscription and want to push well-scoped work — bug investigations, mechanical fixes, code reviews — onto subscription-included open-weight models (GLM, DeepSeek, Qwen, MiniMax, and others) from the workflow they already have. Calls to subscription-included models are included in the subscription, but every call counts against a weekly input-token quota, cached input included. `/nano:rescue` only ever runs when you explicitly ask for it (via the command or by telling Claude to hand work to NanoGPT); Claude does not reach for it on its own. It follows the design of the official [codex-plugin-cc](https://github.com/openai/codex-plugin-cc): slash commands, background jobs, and a thin forwarding subagent.
 
 ## How It Works
 
@@ -335,4 +335,4 @@ The live tests use the real NanoGPT API key from the keychain and cost subscript
 
 ## License
 
-MIT. Forked from [kimi-plugin-cc](https://github.com/charlesverdad/kimi-plugin-cc) (MIT), itself derived from [codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (Apache-2.0). See `NOTICE` for details.
+MIT. Built on [kimi-plugin-cc](https://github.com/charlesverdad/kimi-plugin-cc) (MIT), which is derived from the official [codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (Apache-2.0). This plugin follows codex-plugin-cc's structure and command design. See `NOTICE` for details.
