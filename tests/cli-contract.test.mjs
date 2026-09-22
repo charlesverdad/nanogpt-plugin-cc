@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 
 import {
   REQUIRED_COMMANDS,
@@ -11,91 +12,102 @@ import {
   HELP_ENV
 } from "../plugins/nano/scripts/lib/cli-contract.mjs";
 import { runCommand } from "../plugins/nano/scripts/lib/process.mjs";
+import { makeTempDir, run } from "./helpers.mjs";
+import { installFakeClaude } from "./fake-claude-fixture.mjs";
 
-// A fake `kimi --help` fixture in the REAL Typer/Rich format: ANSI color escape
-// codes, Rich box-drawing borders, an "Options" panel where flags and their
-// short aliases are separated by spaces or commas, a "Commands" panel listing
-// subcommands, and at least one option whose description wraps onto a second
-// line. This proves the parser handles real-world output (it strips ANSI,
-// drops box-drawing, and normalizes whitespace) rather than only a clean fake.
-//
-// Captured/derived from real `kimi --help` (kimi-cli 1.44.0+). The `\x1b[...m`
-// sequences are genuine SGR color codes glued onto flag tokens, exactly as Rich
-// emits them when color is on — the case that broke the original naive parser.
-const C = "\x1b[1;36m"; // cyan bold (used by Rich for option/command names)
-const R = "\x1b[0m"; // reset
+// A realistic commander-style `claude --help` fixture, trimmed to the option
+// lines relevant to the plugin. Based on the real `claude --help` output:
+// commander prints flags and short aliases comma-joined on one line, choice
+// values inside `(choices: "a", "b", ...)`, and wraps long descriptions onto
+// the following indented lines. The fixture keeps the wrapping so the parser
+// is proven against real-world output, not a sanitized fake.
 const FAKE_TOP_LEVEL_HELP = `
- Usage: kimi [OPTIONS] COMMAND [ARGS]...
+Usage: claude [options] [command] [prompt]
 
- Kimi, your next CLI agent.
+Claude Code - starts an interactive session by default, use -p/--print for
+non-interactive output
 
-╭─ Options ──────────────────────────────────────────────────────────────────╮
-│ ${C}--version${R}                    ${C}-V${R}                              Show version and exit.                  │
-│ ${C}--model${R}                      ${C}-m${R}     TEXT                     LLM model to use. Default: default       │
-│                                                                  model set in config file.               │
-│ ${C}--thinking${R}                          ${C}--no-thinking${R}           Enable thinking mode.                    │
-│ ${C}--continue${R}                   ${C}-C${R}                              Continue the previous session for the    │
-│                                                                  working directory. Default: no.         │
-│ ${C}--yolo${R},${C}--yes${R},${C}--auto-approve${R}  ${C}-y${R}              Automatically approve all actions.       │
-│ ${C}--prompt${R},${C}--command${R}           ${C}-p${R},${C}-c${R}   TEXT    User prompt to the agent. Default:       │
-│                                                                  prompt interactively.                   │
-│ ${C}--print${R}                                                     Run in print mode (non-interactive).     │
-│ ${C}--quiet${R}                                                     Alias for \`--print --output-format text   │
-│                                                                  --final-message-only\`.                  │
-│ ${C}--help${R}                       ${C}-h${R}                              Show this message and exit.              │
-╰──────────────────────────────────────────────────────────────────────────────╯
-╭─ Commands ─────────────────────────────────────────────────────────────────╮
-│ ${C}login${R}    Login to your Kimi account.                                         │
-│ ${C}logout${R}   Logout from your Kimi account.                                       │
-│ ${C}term${R}     Run Toad TUI backed by Kimi Code CLI ACP server.                     │
-│ ${C}acp${R}      Run Kimi Code CLI ACP server.                                        │
-│ ${C}info${R}     Show version and protocol information.                               │
-│ ${C}export${R}   Export session data.                                                 │
-│ ${C}mcp${R}      Manage MCP server configurations.                                    │
-│ ${C}plugin${R}   Manage plugins.                                                      │
-│ ${C}vis${R}      Run Kimi Agent Tracing Visualizer.                                   │
-│ ${C}web${R}      Run Kimi Code CLI web interface.                                      │
-╰──────────────────────────────────────────────────────────────────────────────╯
+Options:
+  --allowedTools, --allowed-tools <tools...>
+      Comma or space-separated list of tool names to allow (e.g. "Bash(git *)
+      Edit")
+  -h, --help                            Display help for command
+  --model <model>                       Model for the current session.
+  --output-format <format>              Output format (only works with --print):
+                                        "text" (default), "json" (single
+                                        result), or "stream-json" (realtime
+                                        streaming) (choices: "text", "json",
+                                        "stream-json")
+  --permission-mode <mode>              Permission mode to use for the session
+                                        (choices: "acceptEdits", "auto",
+                                        "bypassPermissions", "manual",
+                                        "dontAsk", "plan")
+  -p, --print                           Print response and exit (useful for
+                                        pipes).
+  --restricted                          Restricted mode: removes the built-in
+                                        tools that run commands or code.
+  -r, --resume [value]                  Resume a conversation by session ID, or
+                                        open interactive picker with optional
+                                        search term
+  --strict-mcp-config                   Only use MCP servers from --mcp-config,
+                                        ignoring all other MCP configurations
+  --tools <tools...>                    Specify the list of available tools from
+                                        the built-in set.
+  --verbose                             Override verbose mode setting from config
+  -v, --version                         Output the version number
 
- Documentation:        https://moonshotai.github.io/kimi-cli/
- LLM friendly version: https://moonshotai.github.io/kimi-cli/llms.txt
+Commands:
+  agents [options]                      Manage background agents
 `;
 
-const FAKE_LOGIN_HELP = `
- Usage: kimi login [OPTIONS]
+// Same fixture with ANSI SGR codes glued onto flag tokens, to prove the
+// tokenizer strips color that commander may emit under a force-color shim.
+const C = "\x1b[1;36m"; // cyan bold
+const R = "\x1b[0m"; // reset
+const ANSI_HELP = `
+Usage: claude [options] [command] [prompt]
 
- Login to your Kimi account.
-
-╭─ Options ──────────────────────────────────────────────────────────────────╮
-│ ${C}--json${R}            Emit OAuth events as JSON lines.                            │
-│ ${C}--help${R}            Show this message and exit.                                 │
-╰──────────────────────────────────────────────────────────────────────────────╯
+Options:
+  ${C}--allowedTools${R}, ${C}--allowed-tools${R} <tools...>
+      Comma or space-separated list of tool names to allow
+  ${C}-p${R}, ${C}--print${R}                       Print response and exit.
+  ${C}--restricted${R}                          Restricted mode.
+  ${C}--strict-mcp-config${R}                   Only use MCP servers from --mcp-config.
+  ${C}--tools${R} <tools...>                    Specify the list of available tools.
+  ${C}--permission-mode${R} <mode>              Permission mode (choices: "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
+  ${C}--output-format${R} <format>              Output format (choices: "text", "json", "stream-json")
+  ${C}--verbose${R}                             Override verbose mode setting from config
+  ${C}-r${R}, ${C}--resume${R} [value]                  Resume a conversation by session ID
+  ${C}--model${R} <model>                       Model for the current session.
+  ${C}-v${R}, ${C}--version${R}                       Output the version number
 `;
 
 function fakeFetchHelp(argv) {
-  if (argv[0] === "login") {
-    return FAKE_LOGIN_HELP;
-  }
-  // ["--help"] (top level)
+  // The manifest only probes ["--help"] (top-level).
   return FAKE_TOP_LEVEL_HELP;
 }
 
-test("manifest covers exactly the kimi surface the companion uses", () => {
-  // Guard against silent drift: the companion relies on these tokens.
+test("manifest covers exactly the claude surface the plugin uses", () => {
   const topLevel = REQUIRED_COMMANDS.find((g) => g.id === "top-level");
-  const tokens = new Set(topLevel.requires.map((r) => r.token));
+  assert.equal(REQUIRED_COMMANDS.length, 1);
+  assert.deepEqual(topLevel.argv, ["--help"]);
+  const tokens = topLevel.requires.map((r) => r.token);
   for (const expected of [
     "--version",
-    "info",
-    "login",
-    "--quiet",
-    "--yolo",
-    "--model",
-    "--thinking",
-    "--continue",
-    "-p"
+    "-p",
+    "--restricted",
+    "--strict-mcp-config",
+    "--tools",
+    "--permission-mode",
+    "dontAsk",
+    "--allowedTools",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--resume",
+    "--model"
   ]) {
-    assert.ok(tokens.has(expected), `manifest must require ${expected}`);
+    assert.ok(tokens.includes(expected), `manifest must require ${expected}`);
   }
 });
 
@@ -104,78 +116,140 @@ test("stripAnsi removes SGR color codes glued to flag tokens", () => {
   assert.equal(stripAnsi("\x1b[0mplain\x1b[1;36m"), "plain");
 });
 
-test("normalizeHelp drops box-drawing and collapses wrapped lines", () => {
+test("normalizeHelp collapses wrapped lines into single-spaced text", () => {
   const normalized = normalizeHelp(FAKE_TOP_LEVEL_HELP);
-  assert.ok(!/[│╭╰─╮╯]/.test(normalized), "box-drawing chars should be gone");
   assert.ok(!/\x1b/.test(normalized), "ANSI escapes should be gone");
-  // The wrapped "--quiet ... Alias for ..." description should still contain
-  // the flag as a discoverable token.
-  assert.ok(/ --quiet /.test(` ${normalized} `));
+  assert.ok(!/\n/.test(normalized), "newlines should be collapsed to spaces");
 });
 
-test("verifyContract passes against a realistic Typer/Rich fake help fixture", () => {
-  const verification = verifyContract(fakeFetchHelp);
-  assert.equal(
-    verification.ok,
-    true,
-    formatContractReport(verification, "fake kimi contract")
-  );
-  assert.deepEqual(verification.missing, []);
-});
-
-test("tokenizer recovers flags/aliases from colored, comma-joined option lines", () => {
+test("tokenizeHelp recovers flags, aliases, and quoted choice values", () => {
   const tokens = tokenizeHelp(FAKE_TOP_LEVEL_HELP);
-  // -p appears as part of "--prompt,--command -p,-c" (comma + color codes).
-  assert.ok(tokens.has("-p"), "-p must survive ANSI + comma joining");
-  assert.ok(tokens.has("--prompt"));
-  // --thinking is printed as "--thinking --no-thinking"; base token matches.
-  assert.ok(tokens.has("--thinking"));
+  // Flags
+  assert.ok(tokens.has("--model"));
+  assert.ok(tokens.has("--tools"));
+  assert.ok(tokens.has("--restricted"));
+  assert.ok(tokens.has("--strict-mcp-config"));
+  assert.ok(tokens.has("--allowedTools"));
+  assert.ok(tokens.has("--allowed-tools"));
+  assert.ok(tokens.has("--permission-mode"));
+  assert.ok(tokens.has("--output-format"));
+  assert.ok(tokens.has("--verbose"));
+  assert.ok(tokens.has("--resume"));
+  assert.ok(tokens.has("-p"));
+  assert.ok(tokens.has("--print"));
   assert.ok(tokens.has("--version"));
-  assert.ok(tokens.has("--continue"));
-  assert.ok(tokens.has("--yolo"));
-  // Subcommands come from the Commands panel.
-  assert.ok(tokens.has("info"));
-  assert.ok(tokens.has("login"));
+  assert.ok(tokens.has("-v"));
+  // Choice values: both quoted and unquoted forms are acceptable.
+  assert.ok(tokens.has("dontAsk"), "dontAsk choice must be discoverable");
+  assert.ok(tokens.has("stream-json"), "stream-json choice must be discoverable");
 });
 
 test("HELP_ENV forces plain, wide output", () => {
   assert.equal(HELP_ENV.NO_COLOR, "1");
   assert.equal(HELP_ENV.TERM, "dumb");
   assert.equal(HELP_ENV.COLUMNS, "200");
+  assert.equal(HELP_ENV.FORCE_COLOR, "0");
 });
 
-test("verifyContract fails loudly when a required flag is genuinely absent", () => {
-  // Negative fixture: a future kimi-cli that removed --yolo (and its aliases)
-  // entirely. Drop the tokens from the option line so they truly vanish.
-  const helpWithoutYolo = FAKE_TOP_LEVEL_HELP.replace(
-    /--yolo|--yes|--auto-approve/g,
-    "--gone"
+test("verifyContract passes when all required tokens are present", () => {
+  const verification = verifyContract(fakeFetchHelp);
+  assert.equal(
+    verification.ok,
+    true,
+    formatContractReport(verification, "fake claude contract")
   );
-  const fetch = (argv) =>
-    argv[0] === "login" ? FAKE_LOGIN_HELP : helpWithoutYolo;
-  const verification = verifyContract(fetch);
-  assert.equal(verification.ok, false, "should fail when --yolo is gone");
+  assert.deepEqual(verification.missing, []);
+});
+
+test("verifyContract satisfies -p via the --print alias", () => {
+  // Remove the "-p" short form, keep only "--print".
+  const help = FAKE_TOP_LEVEL_HELP.replace(/-p, --print/, "--print");
+  const verification = verifyContract(() => help);
+  assert.equal(
+    verification.ok,
+    true,
+    formatContractReport(verification, "alias -p/--print")
+  );
+});
+
+test("verifyContract satisfies --allowedTools via the --allowed-tools alias", () => {
+  const help = FAKE_TOP_LEVEL_HELP.replace(/--allowedTools, --allowed-tools/, "--allowed-tools");
+  const verification = verifyContract(() => help);
+  assert.equal(
+    verification.ok,
+    true,
+    formatContractReport(verification, "alias --allowedTools/--allowed-tools")
+  );
+});
+
+test("verifyContract satisfies --resume via the -r alias", () => {
+  const help = FAKE_TOP_LEVEL_HELP.replace(/-r, --resume/, "-r");
+  const verification = verifyContract(() => help);
+  assert.equal(
+    verification.ok,
+    true,
+    formatContractReport(verification, "alias --resume/-r")
+  );
+});
+
+test("verifyContract satisfies --version via the -v alias", () => {
+  const help = FAKE_TOP_LEVEL_HELP.replace(/-v, --version/, "-v");
+  const verification = verifyContract(() => help);
+  assert.equal(
+    verification.ok,
+    true,
+    formatContractReport(verification, "alias --version/-v")
+  );
+});
+
+test("verifyContract finds dontAsk inside a quoted choices list", () => {
+  // Keep only the quoted form, drop any bare dontAsk elsewhere.
+  const help = FAKE_TOP_LEVEL_HELP.replace(
+    /\(choices: "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"\)/,
+    '(choices: "acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")'
+  );
+  const tokens = tokenizeHelp(help);
+  assert.ok(tokens.has("dontAsk"));
+  const verification = verifyContract(() => help);
+  assert.equal(verification.ok, true, "dontAsk must be found inside quoted choices");
+});
+
+test("verifyContract fails when a required flag is genuinely absent", () => {
+  // Remove --restricted entirely (and not as a substring of anything else).
+  const help = FAKE_TOP_LEVEL_HELP.replace(/--restricted[^\n]*\n\s+[^\n]*\n/, "");
+  assert.ok(!tokenizeHelp(help).has("--restricted"), "sanity: --removed");
+  const verification = verifyContract(() => help);
+  assert.equal(verification.ok, false, "should fail when --restricted is gone");
   assert.ok(
-    verification.missing.some((m) => m.token === "--yolo"),
-    "missing list should call out --yolo"
+    verification.missing.some((m) => m.token === "--restricted"),
+    "missing list should call out --restricted"
   );
 });
 
-test("verifyContract fails loudly when a required subcommand is dropped", () => {
-  // Negative fixture: a future kimi-cli that removed the `info` subcommand.
-  // The command name is colorized (e.g. "\x1b[1;36minfo\x1b[0m"), so target the
-  // colored token rather than a plain word boundary.
-  const helpWithoutInfo = FAKE_TOP_LEVEL_HELP.replace(
-    `${C}info${R}`,
-    `${C}gone${R}`
+test("verifyContract fails when a required choice value is absent", () => {
+  // Drop dontAsk from the choices list (it appears wrapped across lines, so
+  // collapse whitespace first, then strip the quoted value).
+  const help = normalizeHelp(FAKE_TOP_LEVEL_HELP).replace(/, "dontAsk"/, "");
+  assert.ok(!tokenizeHelp(help).has("dontAsk"), "sanity: dontAsk removed");
+  const verification = verifyContract(() => help);
+  assert.equal(verification.ok, false, "should fail when dontAsk choice is gone");
+  assert.ok(verification.missing.some((m) => m.token === "dontAsk"));
+});
+
+test("verifyContract passes against ANSI-colored help", () => {
+  const verification = verifyContract(() => ANSI_HELP);
+  assert.equal(
+    verification.ok,
+    true,
+    formatContractReport(verification, "ansi claude contract")
   );
-  // Sanity: the rename actually removed the discoverable `info` token.
-  assert.ok(!tokenizeHelp(helpWithoutInfo).has("info"));
-  const fetch = (argv) =>
-    argv[0] === "login" ? FAKE_LOGIN_HELP : helpWithoutInfo;
-  const verification = verifyContract(fetch);
-  assert.equal(verification.ok, false);
-  assert.ok(verification.missing.some((m) => m.token === "info"));
+});
+
+test("verifyContract passes when option descriptions wrap across lines", () => {
+  // The base fixture already wraps several descriptions; this asserts that
+  // wrapped lines do not break token discovery.
+  const verification = verifyContract(() => FAKE_TOP_LEVEL_HELP);
+  assert.equal(verification.ok, true);
 });
 
 test("verifyContract reports a fetch failure as missing, not a crash", () => {
@@ -187,21 +261,57 @@ test("verifyContract reports a fetch failure as missing, not a crash", () => {
   assert.ok(verification.missing.every((m) => /help fetch failed/.test(m.reason)));
 });
 
-// Optional real-binary check: if `kimi` is installed on PATH, verify the live
-// command surface too. Skips gracefully (does NOT fail) when kimi is absent,
-// so `npm test` works in CI without kimi installed. Uses HELP_ENV so Typer/Rich
-// emits plain, wide output.
-test("real kimi CLI satisfies the contract (skipped if kimi absent)", (t) => {
+// Run the real check-cli-contract.mjs against the fake claude binary.
+
+const CHECK_SCRIPT = path.resolve(
+  "plugins/nano/scripts/check-cli-contract.mjs"
+);
+
+test("check-cli-contract.mjs exits 0 against fake claude (ok version)", () => {
+  const binDir = makeTempDir("claude-contract-test-");
+  installFakeClaude(binDir);
+  const sep = process.platform === "win32" ? ";" : ":";
+  const env = { ...process.env, PATH: `${binDir}${sep}${process.env.PATH}` };
+  const res = run(process.execPath, [CHECK_SCRIPT], { env });
+  assert.equal(
+    res.status,
+    0,
+    `expected exit 0, got ${res.status}\nstdout=${res.stdout}\nstderr=${res.stderr}`
+  );
+  assert.match(res.stdout, /claude version:/);
+  assert.match(res.stdout, /claude CLI contract.*: OK/);
+});
+
+test("check-cli-contract.mjs exits 1 when claude is older than MIN_CLAUDE_VERSION", () => {
+  const binDir = makeTempDir("claude-contract-test-");
+  installFakeClaude(binDir, "ok", { version: "2.0.0" });
+  const sep = process.platform === "win32" ? ";" : ":";
+  const env = { ...process.env, PATH: `${binDir}${sep}${process.env.PATH}` };
+  const res = run(process.execPath, [CHECK_SCRIPT], { env });
+  assert.equal(
+    res.status,
+    1,
+    `expected exit 1, got ${res.status}\nstdout=${res.stdout}\nstderr=${res.stderr}`
+  );
+  assert.match(res.stderr, /older than the required minimum/);
+  assert.match(res.stderr, /2\.1\.278/);
+});
+
+// Optional real-binary check: if `claude` is installed on PATH, verify the live
+// command surface too. Skips gracefully (does NOT fail) when claude is absent,
+// so `npm test` works in CI without claude installed. Uses HELP_ENV so
+// commander emits plain, wide output.
+test("real claude CLI satisfies the contract (skipped if claude absent)", (t) => {
   const helpEnv = { ...process.env, ...HELP_ENV };
-  const probe = runCommand("kimi", ["--version"], { env: helpEnv });
-  const kimiMissing = probe.error && probe.error.code === "ENOENT";
-  if (kimiMissing) {
-    t.skip("kimi binary not found on PATH");
+  const probe = runCommand("claude", ["--version"], { env: helpEnv });
+  const claudeMissing = probe.error && probe.error.code === "ENOENT";
+  if (claudeMissing) {
+    t.skip("claude binary not found on PATH");
     return;
   }
 
   const fetchRealHelp = (argv) => {
-    const result = runCommand("kimi", argv, {
+    const result = runCommand("claude", argv, {
       maxBuffer: 10 * 1024 * 1024,
       env: helpEnv
     });
@@ -215,6 +325,6 @@ test("real kimi CLI satisfies the contract (skipped if kimi absent)", (t) => {
   assert.equal(
     verification.ok,
     true,
-    formatContractReport(verification, "real kimi contract")
+    formatContractReport(verification, "real claude contract")
   );
 });

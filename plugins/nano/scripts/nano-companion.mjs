@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -21,9 +20,28 @@ import {
   resolveResultJob,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
-import { getKimiAvailability } from "./lib/runtime.mjs";
+import {
+  appendRunLog,
+  buildChildEnv,
+  buildClaudeArgs,
+  buildPermissionProfile,
+  buildRunLogEntry,
+  DEFAULT_BASH_ALLOW,
+  getClaudeAvailability,
+  KEY_SETUP_COMMAND,
+  normalizeBashAllow,
+  parseClaudeJsonOutput,
+  parseClaudeVersion,
+  PROMPT_ARGV_LIMIT,
+  requireApiKey,
+  resolveApiKey,
+  resolveBaseUrl,
+  resolveMaxInlineChars,
+  runClaude,
+  summarizeClaudeResult
+} from "./lib/runtime.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { terminateProcessTree } from "./lib/process.mjs";
 import {
   appendLogLine,
   createJobLogFile,
@@ -48,7 +66,7 @@ import {
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult,
-  renderTaskResult
+  renderTaskRun
 } from "./lib/render.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -56,14 +74,33 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 
+// Model resolution seam. This step ignores `thinking`/`allowPaid`; step 5
+// replaces the body with a catalog-backed lookup (lib/models.mjs) but keeps
+// this same async signature so callers do not need to change.
+const DEFAULT_MODEL = "z-ai/glm-5.2";
+
+async function resolveRunModel({ requested, config, thinking, allowPaid } = {}) {
+  void thinking;
+  void allowPaid;
+  const trimmedRequested = requested ? String(requested).trim() : "";
+  if (trimmedRequested) {
+    return trimmedRequested;
+  }
+  const configModel = config?.model ? String(config.model).trim() : "";
+  if (configModel) {
+    return configModel;
+  }
+  return DEFAULT_MODEL;
+}
+
 function printUsage() {
   console.log(
     [
       "Usage:",
       "  node scripts/nano-companion.mjs setup [--json]",
-      "  node scripts/nano-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/nano-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/nano-companion.mjs task [--background] [--continue] [--model <model>] [--thinking] [prompt]",
+      "  node scripts/nano-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>]",
+      "  node scripts/nano-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [focus text]",
+      "  node scripts/nano-companion.mjs task [--background] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [prompt]",
       "  node scripts/nano-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/nano-companion.mjs result [job-id] [--json]",
       "  node scripts/nano-companion.mjs cancel [job-id] [--json]"
@@ -135,63 +172,47 @@ function firstMeaningfulLine(text, fallback) {
   return line ?? fallback;
 }
 
-async function getKimiAuthStatus(cwd) {
-  const availability = getKimiAvailability(cwd);
+// ---------------------------------------------------------------------------
+// claude availability / setup
+// ---------------------------------------------------------------------------
+
+function ensureClaudeAvailable(cwd) {
+  const availability = getClaudeAvailability(cwd);
   if (!availability.available) {
-    return {
-      available: false,
-      loggedIn: false,
-      detail: availability.detail,
-      source: "availability"
-    };
+    throw new Error("Claude Code is not installed or not on PATH. Install it, then rerun `/nano:setup`.");
   }
-
-  // Try to run a trivial kimi command to check auth
-  const result = binaryAvailable("kimi", ["info"], { cwd });
-  if (!result.available) {
-    // info might not exist in older versions; try login --help instead
-    const loginHelp = binaryAvailable("kimi", ["login", "--help"], { cwd });
-    if (!loginHelp.available) {
-      return {
-        available: true,
-        loggedIn: false,
-        detail: "Unable to verify authentication status",
-        source: "kimi-cli"
-      };
-    }
-  }
-
-  // A simple heuristic: if `kimi info` works, assume logged in
-  // More robust check would require parsing kimi's config, but this is good enough
-  return {
-    available: true,
-    loggedIn: true,
-    detail: "kimi CLI is available",
-    source: "kimi-cli"
-  };
 }
 
 async function buildSetupReport(cwd, actionsTaken = []) {
-  const kimiStatus = getKimiAvailability(cwd);
-  const authStatus = await getKimiAuthStatus(cwd);
-  const config = getConfig(resolveWorkspaceRoot(cwd));
+  const claudeAvailability = getClaudeAvailability(cwd);
+  const version = claudeAvailability.available ? parseClaudeVersion(claudeAvailability.detail) : null;
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const config = getConfig(workspaceRoot);
   const reviewGateEnabled = Boolean(config.stopReviewGate);
+  const apiKey = resolveApiKey();
 
   const nextSteps = [];
-  if (!kimiStatus.available) {
-    nextSteps.push("Install Kimi CLI. See https://moonshotai.github.io/kimi-cli/");
+  if (!claudeAvailability.available) {
+    nextSteps.push("Install Claude Code (https://claude.com/claude-code), then rerun `/nano:setup`.");
   }
-  if (kimiStatus.available && !authStatus.loggedIn) {
-    nextSteps.push("Run `!kimi login`.");
+  if (!apiKey.key) {
+    nextSteps.push(KEY_SETUP_COMMAND);
   }
-  if (!reviewGateEnabled) {
+  if (claudeAvailability.available && apiKey.key && !reviewGateEnabled) {
     nextSteps.push("Optional: run `/nano:setup --enable-review-gate` to require a fresh review before stop.");
   }
 
   return {
-    ready: kimiStatus.available && authStatus.loggedIn,
-    kimi: kimiStatus,
-    auth: authStatus,
+    ready: claudeAvailability.available && Boolean(apiKey.key),
+    claude: {
+      available: claudeAvailability.available,
+      detail: claudeAvailability.detail,
+      version
+    },
+    apiKey: {
+      present: Boolean(apiKey.key),
+      source: apiKey.source
+    },
     reviewGateEnabled,
     actionsTaken,
     nextSteps
@@ -224,71 +245,80 @@ async function handleSetup(argv) {
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
-function ensureKimiAvailable(cwd) {
-  const availability = getKimiAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Kimi CLI is not installed. Install it from https://moonshotai.github.io/kimi-cli/ then rerun `/nano:setup`.");
-  }
-}
+// ---------------------------------------------------------------------------
+// shared executor: spawn `claude -p` against NanoGPT and collect the result
+// ---------------------------------------------------------------------------
 
-function buildKimiArgs({ cwd, model, thinking, continueSession, prompt }) {
-  const args = ["--quiet", "--yolo"];
+/**
+ * request = { cwd, prompt, model, profile ("read"|"write"|profile object),
+ *   bashAllow, resumeSessionId, onProgress }
+ *
+ * The API key is resolved fresh here (never taken from `request`), so a
+ * queued background job's stored request never contains it. Returns
+ * `{ exitStatus, summary (null if no JSON), permissions, model, stderr,
+ * stdout }`. `exitStatus` is 0 only if the process exited 0 AND the stdout
+ * parsed as JSON AND `summary.isError` is false.
+ */
+async function executeClaudeRun({ cwd, prompt, model, profile, bashAllow, resumeSessionId = null, onProgress = null }) {
+  const permissions = typeof profile === "object" && profile !== null ? profile : buildPermissionProfile(profile, { bashAllow });
 
-  if (model) {
-    args.push("--model", model);
-  }
-  if (thinking) {
-    args.push("--thinking");
-  }
-  if (continueSession) {
-    args.push("--continue");
-  }
-
-  args.push("-p", prompt);
-  return args;
-}
-
-function runKimi(cwd, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("kimi", args, {
-      cwd,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
-      windowsHide: true
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    proc.stdout.setEncoding("utf8");
-    proc.stderr.setEncoding("utf8");
-
-    proc.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-
-    proc.stderr.on("data", (chunk) => {
-      stderr += chunk;
-      if (options.onProgress) {
-        options.onProgress(chunk.trimEnd());
-      }
-    });
-
-    proc.on("error", (error) => {
-      reject(error);
-    });
-
-    proc.on("close", (code, signal) => {
-      resolve({
-        status: signal ? 1 : (code ?? 1),
-        stdout,
-        stderr,
-        pid: proc.pid
-      });
-    });
+  const { key: apiKey } = requireApiKey();
+  const env = buildChildEnv({ apiKey, model, baseUrl: resolveBaseUrl() });
+  const promptViaStdin = prompt.length > PROMPT_ARGV_LIMIT;
+  const args = buildClaudeArgs({
+    prompt,
+    model,
+    profile: permissions,
+    resumeSessionId,
+    outputFormat: "json",
+    promptViaStdin
   });
+
+  if (typeof onProgress === "function") {
+    onProgress(`Running NanoGPT (${model}, profile=${permissions.name})...`);
+  }
+
+  const result = await runClaude({
+    cwd,
+    args,
+    env,
+    input: promptViaStdin ? prompt : null
+  });
+
+  const parsed = parseClaudeJsonOutput(result.stdout);
+  const summary = parsed ? summarizeClaudeResult(parsed) : null;
+  const exitStatus = result.status === 0 && summary && summary.isError === false ? 0 : (result.status || 1);
+
+  appendRunLog(
+    buildRunLogEntry({
+      model,
+      cwd,
+      allowedTools: permissions.allowedTools,
+      task: prompt,
+      summary: summary ?? {
+        isError: true,
+        numTurns: null,
+        usage: {},
+        durationMs: null,
+        permissionDenials: [],
+        sessionId: null
+      }
+    })
+  );
+
+  return {
+    exitStatus,
+    summary,
+    permissions,
+    model,
+    stderr: result.stderr,
+    stdout: result.stdout
+  };
 }
+
+// ---------------------------------------------------------------------------
+// review
+// ---------------------------------------------------------------------------
 
 function buildReviewPrompt(context, focusText, adversarial = false) {
   if (adversarial) {
@@ -307,8 +337,10 @@ function buildReviewPrompt(context, focusText, adversarial = false) {
   });
 }
 
+// Reviews always run the `read` permission profile: review is genuinely
+// read-only, unlike a rescue `task` run.
 async function executeReviewRun(request) {
-  ensureKimiAvailable(request.cwd);
+  ensureClaudeAvailable(request.cwd);
   ensureGitRepository(request.cwd);
 
   const target = resolveReviewTarget(request.cwd, {
@@ -321,109 +353,127 @@ async function executeReviewRun(request) {
   const context = collectReviewContext(request.cwd, target);
   const prompt = buildReviewPrompt(context, focusText, reviewName === "Adversarial Review");
 
-  const args = buildKimiArgs({
+  const run = await executeClaudeRun({
     cwd: request.cwd,
+    prompt,
     model: request.model,
-    prompt
+    profile: "read",
+    onProgress: request.onProgress
   });
 
-  const result = await runKimi(request.cwd, args, {
-    onProgress: request.onProgress
+  const rendered = renderReviewResult({
+    reviewLabel: reviewName,
+    targetLabel: context.target.label,
+    summary: run.summary,
+    model: run.model,
+    stdout: run.stdout,
+    stderr: run.stderr
   });
 
   const payload = {
     review: reviewName,
     target,
-    kimi: {
-      status: result.status,
-      stderr: result.stderr,
-      stdout: result.stdout
-    }
+    status: run.exitStatus,
+    isError: run.summary ? run.summary.isError : true,
+    text: run.summary ? run.summary.text : "",
+    claudeSessionId: run.summary?.sessionId ?? null,
+    model: run.model,
+    usage: run.summary?.usage ?? {},
+    permissionDenials: run.summary?.permissionDenials ?? [],
+    numTurns: run.summary?.numTurns ?? null,
+    durationMs: run.summary?.durationMs ?? null,
+    stderr: run.stderr
   };
 
-  const rendered = renderReviewResult(
-    {
-      status: result.status,
-      stdout: result.stdout,
-      stderr: result.stderr
-    },
-    { reviewLabel: reviewName, targetLabel: context.target.label }
-  );
-
   return {
-    exitStatus: result.status,
+    exitStatus: run.exitStatus,
     payload,
     rendered,
-    summary: firstMeaningfulLine(result.stdout, `${reviewName} completed.`),
-    jobTitle: `Kimi ${reviewName}`,
+    summary: run.summary
+      ? firstMeaningfulLine(run.summary.text, `${reviewName} completed.`)
+      : firstMeaningfulLine(run.stderr || run.stdout, `${reviewName} did not return a result.`),
+    jobTitle: `NanoGPT ${reviewName}`,
     jobClass: "review",
     targetLabel: target.label
   };
 }
 
+// ---------------------------------------------------------------------------
+// task
+// ---------------------------------------------------------------------------
+
 async function executeTaskRun(request) {
-  ensureKimiAvailable(request.cwd);
+  ensureClaudeAvailable(request.cwd);
 
-  const taskMetadata = buildTaskRunMetadata({
-    prompt: request.prompt,
-    continueSession: request.continueSession
-  });
+  const prompt = request.prompt || "Continue from where you left off.";
 
-  if (!request.prompt && !request.continueSession) {
-    throw new Error("Provide a prompt, piped stdin, or use --continue.");
-  }
-
-  const args = buildKimiArgs({
+  const run = await executeClaudeRun({
     cwd: request.cwd,
+    prompt,
     model: request.model,
-    thinking: request.thinking,
-    continueSession: request.continueSession,
-    prompt: request.prompt || "Continue from where you left off."
-  });
-
-  const result = await runKimi(request.cwd, args, {
+    profile: request.profile,
+    bashAllow: request.bashAllow,
+    resumeSessionId: request.resumeSessionId ?? null,
     onProgress: request.onProgress
   });
 
-  const rawOutput = result.stdout;
-  const failureMessage = result.stderr ?? "";
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage
-    },
-    {
-      title: taskMetadata.title,
-      jobId: request.jobId ?? null
-    }
-  );
+  const { rendered, footer } = renderTaskRun({
+    summary: run.summary,
+    model: run.model,
+    jobId: request.jobId ?? null,
+    maxChars: resolveMaxInlineChars(),
+    stdout: run.stdout,
+    stderr: run.stderr
+  });
+
   const payload = {
-    status: result.status,
-    rawOutput,
-    stderr: result.stderr
+    status: run.exitStatus,
+    isError: run.summary ? run.summary.isError : true,
+    rawOutput: run.summary ? run.summary.text : "",
+    claudeSessionId: run.summary?.sessionId ?? null,
+    model: run.model,
+    profile: run.permissions.name,
+    bashAllow: run.permissions.bashAllow,
+    usage: run.summary?.usage ?? {},
+    permissionDenials: run.summary?.permissionDenials ?? [],
+    numTurns: run.summary?.numTurns ?? null,
+    durationMs: run.summary?.durationMs ?? null,
+    stderr: run.stderr,
+    footer
   };
 
+  const summary = run.summary
+    ? firstMeaningfulLine(run.summary.text, run.summary.isError ? "NanoGPT run failed." : "Task finished.")
+    : firstMeaningfulLine(run.stderr || run.stdout, "NanoGPT did not return a result.");
+
   return {
-    exitStatus: result.status,
+    exitStatus: run.exitStatus,
     payload,
     rendered,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
-    jobTitle: taskMetadata.title,
+    summary,
+    jobTitle: request.jobTitle ?? null,
     jobClass: "task",
-    write: true
+    write: run.permissions.name === "write",
+    jobPatch: {
+      claudeSessionId: payload.claudeSessionId,
+      model: run.model,
+      profile: run.permissions.name,
+      bashAllow: run.permissions.bashAllow,
+      cwd: request.cwd
+    }
   };
 }
 
 function buildReviewJobMetadata(reviewName, target) {
   return {
     kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
-    title: reviewName === "Review" ? "Kimi Review" : `Kimi ${reviewName}`,
+    title: reviewName === "Review" ? "NanoGPT Review" : `NanoGPT ${reviewName}`,
     summary: `${reviewName} ${target.label}`
   };
 }
 
 function buildTaskRunMetadata({ prompt, continueSession = false }) {
-  const title = continueSession ? "Kimi Continue" : "Kimi Task";
+  const title = continueSession ? "NanoGPT Continue" : "NanoGPT Task";
   const fallbackSummary = continueSession ? "Continue previous session" : "Task";
   return {
     title,
@@ -478,13 +528,14 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, thinking, prompt, continueSession, jobId }) {
+function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId }) {
   return {
     cwd,
     model,
-    thinking,
     prompt,
-    continueSession,
+    profile,
+    bashAllow,
+    resumeSessionId,
     jobId
   };
 }
@@ -492,12 +543,6 @@ function buildTaskRequest({ cwd, model, thinking, prompt, continueSession, jobId
 function readTaskPrompt(cwd, options, positionals) {
   const positionalPrompt = positionals.join(" ");
   return positionalPrompt || readStdinIfPiped();
-}
-
-function requireTaskRequest(prompt, continueSession) {
-  if (!prompt && !continueSession) {
-    throw new Error("Provide a prompt, piped stdin, or use --continue.");
-  }
 }
 
 async function runForegroundCommand(job, runner, options = {}) {
@@ -565,6 +610,7 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const workspaceConfig = getConfig(workspaceRoot);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -581,6 +627,8 @@ async function handleReviewCommand(argv, config) {
     summary: metadata.summary
   });
 
+  const model = await resolveRunModel({ requested: options.model, config: workspaceConfig });
+
   await runForegroundCommand(
     job,
     (progress) =>
@@ -588,7 +636,7 @@ async function handleReviewCommand(argv, config) {
         cwd,
         base: options.base,
         scope: options.scope,
-        model: options.model,
+        model,
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
@@ -603,59 +651,127 @@ async function handleReview(argv) {
   });
 }
 
+// Find the newest finished `task` job for the current Claude session (or, if
+// no session id is set, the newest finished task job overall). Shared by the
+// `task-resume-candidate` subcommand and `task --continue`.
+function resolveTaskResumeCandidate(workspaceRoot) {
+  const sessionId = process.env[SESSION_ID_ENV] ?? null;
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const visibleJobs = sessionId ? jobs.filter((job) => job.sessionId === sessionId) : jobs;
+
+  const indexEntry = visibleJobs.find(
+    (job) => job.jobClass === "task" && job.status !== "queued" && job.status !== "running"
+  ) ?? null;
+
+  if (!indexEntry) {
+    return { sessionId, candidate: null };
+  }
+
+  const stored = readStoredJob(workspaceRoot, indexEntry.id);
+  const candidate = {
+    id: indexEntry.id,
+    status: indexEntry.status,
+    title: indexEntry.title ?? null,
+    summary: indexEntry.summary ?? null,
+    completedAt: indexEntry.completedAt ?? null,
+    updatedAt: indexEntry.updatedAt ?? null,
+    claudeSessionId: stored?.claudeSessionId ?? indexEntry.claudeSessionId ?? null,
+    cwd: stored?.cwd ?? indexEntry.cwd ?? null,
+    model: stored?.model ?? indexEntry.model ?? null,
+    profile: stored?.profile ?? indexEntry.profile ?? null,
+    bashAllow: stored?.bashAllow ?? indexEntry.bashAllow ?? []
+  };
+
+  return { sessionId, candidate };
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "cwd"],
-    booleanOptions: ["json", "continue", "background", "thinking", "wait"],
+    multiValueOptions: ["allow-bash"],
+    booleanOptions: ["json", "continue", "background", "thinking", "wait", "read-only", "allow-paid", "fresh"],
     aliasMap: {
       m: "model"
     }
   });
 
-  const cwd = resolveCommandCwd(options);
+  if (options["read-only"] && options["allow-bash"]) {
+    throw new Error("`--read-only` cannot be combined with `--allow-bash`.");
+  }
+
+  const explicitCwd = Boolean(options.cwd);
+  const invocationCwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = options.model ? String(options.model).trim() : null;
-  const prompt = readTaskPrompt(cwd, options, positionals);
+  const config = getConfig(workspaceRoot);
+
   const continueSession = Boolean(options.continue);
   const thinking = Boolean(options.thinking);
+  const allowPaid = Boolean(options["allow-paid"]);
+  const readOnly = Boolean(options["read-only"]);
 
-  if (!prompt && !continueSession) {
+  let prompt = readTaskPrompt(invocationCwd, options, positionals);
+  let cwd = invocationCwd;
+  let resumeSessionId = null;
+  let carriedModel = null;
+  let carriedProfile = null;
+
+  if (continueSession) {
+    const { candidate } = resolveTaskResumeCandidate(workspaceRoot);
+    if (!candidate) {
+      throw new Error("No resumable NanoGPT task found for this session. Run without --continue to start a new task.");
+    }
+    if (!candidate.claudeSessionId) {
+      throw new Error(
+        `Task ${candidate.id} has no NanoGPT session to resume (it may have failed before one was created). Run without --continue to start a new task.`
+      );
+    }
+    resumeSessionId = candidate.claudeSessionId;
+    if (!explicitCwd && candidate.cwd) {
+      cwd = candidate.cwd;
+    }
+    carriedModel = candidate.model ?? null;
+    carriedProfile = candidate.profile ?? null;
+    if (!prompt) {
+      prompt = "Continue from where you left off.";
+    }
+  }
+
+  if (!prompt) {
     throw new Error("Provide a prompt, piped stdin, or use --continue.");
   }
 
-  const taskMetadata = buildTaskRunMetadata({
-    prompt,
-    continueSession
-  });
+  const profile = readOnly ? "read" : continueSession && carriedProfile ? carriedProfile : "write";
+  const bashAllow = normalizeBashAllow([
+    ...DEFAULT_BASH_ALLOW,
+    ...(config.bashAllow ?? []),
+    ...(options["allow-bash"] ?? [])
+  ]);
+
+  const requestedModel = options.model ? String(options.model).trim() : carriedModel;
+  const model = await resolveRunModel({ requested: requestedModel, config, thinking, allowPaid });
+
+  const taskMetadata = buildTaskRunMetadata({ prompt, continueSession });
 
   if (options.background) {
-    ensureKimiAvailable(cwd);
-    requireTaskRequest(prompt, continueSession);
-
-    const job = buildTaskJob(workspaceRoot, taskMetadata, true);
-    const request = buildTaskRequest({
-      cwd,
-      model,
-      thinking,
-      prompt,
-      continueSession,
-      jobId: job.id
-    });
+    ensureClaudeAvailable(cwd);
+    const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write");
+    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, true);
+  const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write");
   await runForegroundCommand(
     job,
     (progress) =>
       executeTaskRun({
         cwd,
         model,
-        thinking,
         prompt,
-        continueSession,
+        profile,
+        bashAllow,
+        resumeSessionId,
         jobId: job.id,
         onProgress: progress
       }),
@@ -786,18 +902,8 @@ function handleTaskResumeCandidate(argv) {
     booleanOptions: ["json"]
   });
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const sessionId = process.env[SESSION_ID_ENV] ?? null;
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const visibleJobs = sessionId ? jobs.filter((job) => job.sessionId === sessionId) : jobs;
-
-  const candidate = visibleJobs.find(
-    (job) =>
-      job.jobClass === "task" &&
-      job.status !== "queued" &&
-      job.status !== "running"
-  ) ?? null;
+  const { sessionId, candidate } = resolveTaskResumeCandidate(workspaceRoot);
 
   const payload = {
     available: Boolean(candidate),

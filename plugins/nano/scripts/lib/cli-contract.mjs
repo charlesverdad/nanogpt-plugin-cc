@@ -1,94 +1,102 @@
-// Single source of truth for the `kimi` CLI command surface this plugin depends on.
+// Single source of truth for the `claude` (Claude Code) CLI command surface
+// this plugin depends on.
 //
-// The nano-companion shells out to the global `kimi` binary. If a future
-// kimi-cli release renames or removes a subcommand or flag we rely on, the
+// The nano-companion shells out to the global `claude` binary running headless
+// against NanoGPT:
+//
+//   claude --version
+//   claude -p --restricted --strict-mcp-config --model <m>
+//        --tools=<list> --permission-mode dontAsk
+//        --allowedTools=<list> --output-format json|stream-json
+//        [--verbose] [--resume <id>] -- <prompt>
+//
+// If a future Claude Code release renames or removes a flag we rely on, the
 // plugin breaks at runtime. This module encodes the required command surface
-// and verifies it against `kimi --help` / `kimi <subcommand> --help` output.
+// and verifies it against `claude --help` output.
 //
 // We verify against *help text* (the stable, documented contract) rather than
 // actually executing tasks, so the check is fast, offline, and never requires
 // authentication.
 //
-// IMPORTANT: kimi-cli renders help via Typer/Rich. The output contains ANSI
-// color escape codes and Rich box-drawing characters, and option lines wrap at
-// the terminal width. To match reliably we must (a) ask the CLI for plain, wide
-// output (NO_COLOR=1, TERM=dumb, COLUMNS=200), (b) strip any ANSI escapes that
-// leak through anyway, and (c) normalize whitespace before tokenizing. A naive
-// substring/whitespace tokenizer on the raw, colored, narrow output produces
-// false negatives (every flag glued to an escape code looks "missing").
+// Claude Code renders help via commander. The output is plain text (no
+// box-drawing), but commander still wraps long option lines at the terminal
+// width, and it can emit ANSI color codes when a TTY is attached. To match
+// reliably we must (a) ask the CLI for plain, wide output (NO_COLOR=1,
+// TERM=dumb, COLUMNS=200), (b) strip any ANSI escapes that leak through
+// anyway, and (c) normalize whitespace before tokenizing. A naive
+// substring/whitespace tokenizer on raw, colored, narrow output produces false
+// negatives (every flag glued to an escape code, or a flag split across two
+// wrapped lines, looks "missing").
 
 /**
- * The authoritative manifest of the `kimi` command surface this plugin
+ * The authoritative manifest of the `claude` command surface this plugin
  * requires. Each entry describes one help-text source we parse and the
- * tokens (subcommands / flags) that must appear in it.
+ * tokens (flags / flag values) that must appear in it.
  *
- * `argv` is what we pass to `kimi` to obtain the relevant help text:
- *   []                     -> `kimi --help`        (top-level help)
- *   ["login", "--help"]    -> `kimi login --help`  (subcommand help)
+ * `argv` is what we pass to `claude` to obtain the relevant help text:
+ *   ["--help"]  -> `claude --help`  (top-level help; all our flags are global)
  *
  * `requires` is the list of tokens that must be present in that help text.
  * Each requirement is `{ token, kind, note }`:
- *   - token: the literal string to look for (flag like "--model" or a
- *            subcommand name like "info").
- *   - kind:  "flag" | "subcommand" (informational / for reporting).
+ *   - token: the literal string to look for (a flag like "--model", or a flag
+ *            value like "dontAsk").
+ *   - kind:  "flag" | "choice" (informational / for reporting). "choice" marks
+ *            a value that must appear inside a `(choices: ...)` list.
  *   - note:  where in the plugin this is used (informational).
  *
- * Derived from plugins/nano/scripts/nano-companion.mjs:
- *   - getKimiAvailability(): `kimi --version`
- *   - getKimiAuthStatus():   `kimi info`, `kimi login --help`
- *   - buildKimiArgs():       `--quiet`, `--yolo`, `--model`, `--thinking`,
- *                            `--continue`, `-p` (used by task + review runs)
+ * Derived from plugins/nano/scripts/lib/runtime.mjs:
+ *   - getClaudeAvailability(): `claude --version`
+ *   - buildClaudeArgs():       `-p`, `--restricted`, `--strict-mcp-config`,
+ *                              `--model`, `--tools`, `--permission-mode
+ *                              dontAsk`, `--allowedTools`, `--output-format
+ *                              json|stream-json`, `--verbose` (with
+ *                              stream-json), `--resume`.
  */
 export const REQUIRED_COMMANDS = [
   {
     id: "top-level",
-    description: "kimi top-level help (subcommands + global run flags)",
+    description: "claude top-level help (global flags used by buildClaudeArgs)",
     argv: ["--help"],
     requires: [
-      { token: "--version", kind: "flag", note: "getKimiAvailability() runs `kimi --version`" },
-      { token: "info", kind: "subcommand", note: "getKimiAuthStatus() runs `kimi info`" },
-      { token: "login", kind: "subcommand", note: "getKimiAuthStatus() probes `kimi login --help`; setup suggests `!kimi login`" },
-      { token: "--quiet", kind: "flag", note: "buildKimiArgs() always passes --quiet" },
-      { token: "--yolo", kind: "flag", note: "buildKimiArgs() always passes --yolo" },
-      { token: "--model", kind: "flag", note: "buildKimiArgs() passes --model <model> when set" },
-      { token: "--thinking", kind: "flag", note: "buildKimiArgs() passes --thinking for tasks" },
-      { token: "--continue", kind: "flag", note: "buildKimiArgs() passes --continue to resume" },
-      { token: "-p", kind: "flag", note: "buildKimiArgs() passes -p <prompt> (print mode)" }
-    ]
-  },
-  {
-    id: "login",
-    description: "kimi login --help (auth-status fallback probe)",
-    argv: ["login", "--help"],
-    // We only need `login` to be a real subcommand that responds to --help;
-    // any non-empty help output that mentions login satisfies this.
-    requires: [
-      { token: "login", kind: "subcommand", note: "getKimiAuthStatus() probes `kimi login --help`" }
+      { token: "--version", kind: "flag", note: "getClaudeAvailability() runs `claude --version`" },
+      { token: "-p", kind: "flag", note: "buildClaudeArgs() always passes -p (print/headless mode)" },
+      { token: "--restricted", kind: "flag", note: "buildClaudeArgs() always passes --restricted" },
+      { token: "--strict-mcp-config", kind: "flag", note: "buildClaudeArgs() always passes --strict-mcp-config" },
+      { token: "--tools", kind: "flag", note: "buildClaudeArgs() passes --tools=<list>" },
+      { token: "--permission-mode", kind: "flag", note: "buildClaudeArgs() passes --permission-mode dontAsk" },
+      { token: "dontAsk", kind: "choice", note: "buildClaudeArgs() sets --permission-mode to dontAsk" },
+      { token: "--allowedTools", kind: "flag", note: "buildClaudeArgs() passes --allowedTools=<list>" },
+      { token: "--output-format", kind: "flag", note: "buildClaudeArgs() passes --output-format json|stream-json" },
+      { token: "stream-json", kind: "choice", note: "buildClaudeArgs() uses --output-format stream-json for streamed runs" },
+      { token: "--verbose", kind: "flag", note: "buildClaudeArgs() passes --verbose with stream-json" },
+      { token: "--resume", kind: "flag", note: "buildClaudeArgs() passes --resume <id> to resume a session" },
+      { token: "--model", kind: "flag", note: "buildClaudeArgs() passes --model <model>" }
     ]
   }
 ];
 
 /**
- * Environment overrides that force `kimi` (Typer/Rich) to emit plain, wide help
- * text: no ANSI color, a "dumb" terminal, and a wide column count so option
- * lines do not wrap mid-token. Callers that invoke the real binary should merge
- * this into the child process env. Exported so the test and the CI runner share
- * exactly one definition.
+ * Environment overrides that force `claude` (commander) to emit plain, wide
+ * help text: no ANSI color, a "dumb" terminal, and a wide column count so
+ * option lines do not wrap mid-token. Callers that invoke the real binary
+ * should merge this into the child process env. Exported so the test and the
+ * CI runner share exactly one definition.
  */
 export const HELP_ENV = Object.freeze({
   NO_COLOR: "1",
-  // Some Rich/Typer code paths still colorize unless this is also set.
+  // Commander checks TERM/TTY; a dumb terminal discourages color.
   TERM: "dumb",
-  // Wide enough that no required option line wraps.
+  // Wide enough that no required option line wraps mid-token.
   COLUMNS: "200",
   // Belt-and-suspenders: make sure nothing forces color back on.
   FORCE_COLOR: "0"
 });
 
 /**
- * Remove ANSI escape sequences (CSI color codes, etc.) from a string. Typer/Rich
- * may emit these even when NO_COLOR is requested, and when glued to a flag (e.g.
- * "\x1b[1;36m--version\x1b[0m") they make the flag undiscoverable.
+ * Remove ANSI escape sequences (CSI color codes, etc.) from a string.
+ * Commander may emit these even when NO_COLOR is requested (e.g. when run
+ * under a force-color shim), and when glued to a flag (e.g.
+ * "\x1b[1m--version\x1b[0m") they make the flag undiscoverable.
  *
  * @param {string} text
  * @returns {string}
@@ -100,28 +108,28 @@ export function stripAnsi(text) {
 }
 
 /**
- * Normalize help text into a flat, ANSI-free, single-spaced form. This collapses
- * the box-drawing layout and wrapped lines that Rich produces so that token
- * matching is stable regardless of terminal width or color settings.
+ * Normalize help text into a flat, ANSI-free, single-spaced form. This
+ * collapses the wrapped lines that commander produces so that token matching
+ * is stable regardless of terminal width or color settings.
  *
  * @param {string} text
  * @returns {string}
  */
 export function normalizeHelp(text) {
   return stripAnsi(text)
-    // Drop Rich box-drawing characters so they don't fuse with tokens.
-    .replace(/[─-╿]/g, " ")
-    // Collapse all whitespace (including newlines) to single spaces.
+    // Collapse all whitespace (including newlines) to single spaces so a
+    // flag split across two wrapped lines is still discoverable.
     .replace(/\s+/g, " ")
     .trim();
 }
 
 /**
  * Tokenize help text into a set of tokens, after stripping ANSI escapes and
- * normalizing whitespace. Splits on whitespace and the separators help
- * formatters use ("," "|" "/" parens/brackets) so individual flags and short
- * aliases are discoverable even when printed as "--prompt,--command -p,-c" or
- * "--thinking/--no-thinking".
+ * normalizing whitespace. Splits on whitespace and the separators commander
+ * uses ("," "|" "/" parens/brackets, and the surrounding quotes around choice
+ * values) so individual flags, short aliases, and choice values are all
+ * discoverable even when printed as "-p, --print" or
+ * `(choices: "acceptEdits", "dontAsk", "plan")`.
  *
  * @param {string} helpText
  * @returns {Set<string>}
@@ -129,8 +137,8 @@ export function normalizeHelp(text) {
 export function tokenizeHelp(helpText) {
   const tokens = new Set();
   const text = normalizeHelp(helpText);
-  // Split on whitespace and a few separators help formatters use.
-  for (const raw of text.split(/[\s,|/()\[\]]+/)) {
+  // Split on whitespace, list separators, and wrapping/quote characters.
+  for (const raw of text.split(/[\s,|/()\[\]"']+/)) {
     if (!raw) {
       continue;
     }
@@ -154,7 +162,10 @@ export function tokenizeHelp(helpText) {
  *
  * A requirement is satisfied if its exact token appears as a standalone token
  * in the help output. We also accept a small set of documented equivalences so
- * a help formatter that prints e.g. `-p, --print` still satisfies `-p`.
+ * a help line that prints e.g. `-p, --print` still satisfies `-p`, and one
+ * that prints `--allowedTools, --allowed-tools` still satisfies
+ * `--allowedTools`. Both forms are accepted because commander treats them as
+ * aliases for the same flag.
  *
  * @param {{token: string, kind: string}} requirement
  * @param {Set<string>} tokens
@@ -164,16 +175,18 @@ function requirementSatisfied(requirement, tokens) {
   if (tokens.has(requirement.token)) {
     return true;
   }
-  // Documented equivalences: the plugin passes the short/long forms below,
-  // but kimi help may list the alternate spelling. Both forms are accepted
-  // because kimi-cli treats them as aliases for the same flag. (Verified against
-  // kimi-cli source: `--prompt/-p/--command/-c`, `--continue/-C`, `--model/-m`,
-  // `--version/-V` are all aliases of one option.)
+  // Documented equivalences: the plugin passes the forms on the left, but
+  // claude --help may list the alternate spelling. Verified against the
+  // commander option definitions in Claude Code:
+  //   -p            also "--print"
+  //   --allowedTools also "--allowed-tools"
+  //   --resume       also "-r"
+  //   --version      also "-v"
   const equivalents = {
-    "-p": ["--prompt", "--command", "-c"],
-    "--continue": ["-C"],
-    "--model": ["-m"],
-    "--version": ["-V"]
+    "-p": ["--print"],
+    "--allowedTools": ["--allowed-tools"],
+    "--resume": ["-r"],
+    "--version": ["-v"]
   };
   const alts = equivalents[requirement.token];
   if (alts) {
@@ -186,9 +199,9 @@ function requirementSatisfied(requirement, tokens) {
  * Verify the full manifest against help text supplied by `fetchHelp`.
  *
  * @param {(argv: string[]) => string} fetchHelp
- *   Synchronous function that, given an argv (e.g. ["--help"] or
- *   ["login", "--help"]), returns the corresponding `kimi` help text. It may
- *   return an empty string if the help could not be obtained.
+ *   Synchronous function that, given an argv (e.g. ["--help"]), returns the
+ *   corresponding `claude` help text. It may return an empty string if the
+ *   help could not be obtained.
  * @param {object} [options]
  * @param {Array} [options.manifest] Override the manifest (defaults to REQUIRED_COMMANDS).
  * @returns {{ ok: boolean, results: Array, missing: Array }}
@@ -248,12 +261,12 @@ export function verifyContract(fetchHelp, options = {}) {
  * @param {string} [label]
  * @returns {string}
  */
-export function formatContractReport(verification, label = "kimi CLI contract") {
+export function formatContractReport(verification, label = "claude CLI contract") {
   const lines = [];
   const status = verification.ok ? "OK" : "FAILED";
   lines.push(`${label}: ${status}`);
   for (const group of verification.results) {
-    lines.push(`  [${group.id}] kimi ${group.argv.join(" ")}`);
+    lines.push(`  [${group.id}] claude ${group.argv.join(" ")}`);
     if (group.fetchError) {
       lines.push(`    ! could not fetch help: ${group.fetchError}`);
     }

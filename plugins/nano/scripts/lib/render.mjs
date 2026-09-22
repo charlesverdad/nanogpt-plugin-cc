@@ -67,14 +67,16 @@ function appendActiveJobsTable(lines, jobs) {
 }
 
 export function renderSetupReport(report) {
+  const claudeDetail = report.claude.version ? `${report.claude.detail} (version ${report.claude.version})` : report.claude.detail;
+  const apiKeyDetail = report.apiKey.present ? `present (${report.apiKey.source})` : "missing";
   const lines = [
     "# NanoGPT Setup",
     "",
     `Status: ${report.ready ? "ready" : "needs attention"}`,
     "",
     "Checks:",
-    `- kimi: ${report.kimi.detail}`,
-    `- auth: ${report.auth.detail}`,
+    `- claude: ${claudeDetail}`,
+    `- api key: ${apiKeyDetail}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
     ""
   ];
@@ -97,39 +99,56 @@ export function renderSetupReport(report) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderReviewResult(result, meta) {
-  const stdout = result.stdout.trim();
-  const stderr = result.stderr.trim();
-  const lines = [
-    `# NanoGPT ${meta.reviewLabel}`,
-    "",
-    `Target: ${meta.targetLabel}`,
-    ""
-  ];
+/**
+ * Fallback body used when a `claude` run produced no parseable JSON result
+ * (a crash, a timeout, or a non-JSON stdout). There is no footer in this
+ * case: without a result object there are no turns/tokens/session to report.
+ */
+export function renderNoResultBody({ stdout = "", stderr = "" } = {}) {
+  const tail = String(stderr ?? "").trim() || String(stdout ?? "").trim();
+  const lines = ["NanoGPT did not return a result."];
+  if (tail) {
+    lines.push("", "```text", tail, "```");
+  }
+  return `${lines.join("\n")}\n`;
+}
 
-  if (stdout) {
-    lines.push(stdout);
-  } else if (result.status === 0) {
-    lines.push("NanoGPT review completed without any stdout output.");
-  } else {
-    lines.push("NanoGPT review failed.");
+/**
+ * Render a `review` / `adversarial-review` run: header, target, the full
+ * (untruncated) result text, and the run footer. When there is no parseable
+ * result, falls back to `renderNoResultBody` with no footer.
+ */
+export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "" } = {}) {
+  const lines = [`# NanoGPT ${reviewLabel}`, "", `Target: ${targetLabel}`, ""];
+
+  if (!summary) {
+    lines.push(renderNoResultBody({ stdout, stderr }).trimEnd());
+    return `${lines.join("\n").trimEnd()}\n`;
   }
 
-  if (stderr) {
-    lines.push("", "stderr:", "", "```text", stderr, "```");
-  }
-
+  const text = String(summary.text ?? "").trim() || "NanoGPT review completed without any output.";
+  lines.push(summary.isError ? `NanoGPT review failed:\n\n${text}` : text);
+  lines.push("", renderRunFooter({ model, summary }));
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderTaskResult(result, meta) {
-  const rawOutput = typeof result?.rawOutput === "string" ? result.rawOutput : "";
-  if (rawOutput) {
-    return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+/**
+ * Render a foreground/job body for a `task` run: the (possibly truncated,
+ * for inline display) result text plus the run footer. Returns both the
+ * rendered string and the footer alone, so the caller can store the footer
+ * separately for a later untruncated re-render (see `renderStoredJobResult`).
+ * Falls back to `renderNoResultBody` (no footer) when there is no parseable
+ * result at all.
+ */
+export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "" } = {}) {
+  if (!summary) {
+    return { rendered: renderNoResultBody({ stdout, stderr }), footer: null };
   }
 
-  const message = String(result?.failureMessage ?? "").trim() || "NanoGPT did not return a final message.";
-  return `${message}\n`;
+  const { text } = truncateInline(summary.text, { maxChars, jobId });
+  const footer = renderRunFooter({ model, summary });
+  const body = summary.isError ? `NanoGPT run failed:\n\n${text}` : text;
+  return { rendered: `${body}\n\n${footer}\n`, footer };
 }
 
 export function renderStatusReport(report) {
@@ -193,7 +212,11 @@ export function renderStoredJobResult(job, storedJob) {
   const rawOutput =
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) || "";
   if (rawOutput) {
-    return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+    const isError = Boolean(storedJob?.result?.isError);
+    const footer = typeof storedJob?.result?.footer === "string" ? storedJob.result.footer : "";
+    const body = isError ? `NanoGPT run failed:\n\n${rawOutput}` : rawOutput;
+    const withFooter = footer ? `${body}\n\n${footer}` : body;
+    return withFooter.endsWith("\n") ? withFooter : `${withFooter}\n`;
   }
 
   if (storedJob?.rendered) {
@@ -239,4 +262,64 @@ export function renderCancelReport(job) {
   lines.push("- Check `/nano:status` for the updated queue.");
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// claude output rendering helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Render permission denials as `Tool(detail)` entries, deduplicated and joined
+ * by ", ". Detail is the command/file_path/pattern; entries longer than 60
+ * chars become "…" + the last 59 chars (mirrors bin/nano-agent's footer).
+ */
+export function formatDenials(denials = []) {
+  if (!Array.isArray(denials)) {
+    return "";
+  }
+  const rendered = new Set();
+  for (const denial of denials) {
+    if (!denial) {
+      continue;
+    }
+    const toolName = denial.tool_name ?? "";
+    let detail = String(denial.tool_input?.command ?? denial.tool_input?.file_path ?? denial.tool_input?.pattern ?? "");
+    if (detail.length > 60) {
+      detail = `…${detail.slice(-59)}`;
+    }
+    rendered.add(`${toolName}(${detail})`);
+  }
+  return [...rendered].join(", ");
+}
+
+/**
+ * One-line run footer mirroring bin/nano-agent's `[nano-agent] ...` footer.
+ */
+export function renderRunFooter({ model, summary }) {
+  const usage = summary.usage ?? {};
+  const inputTokens = usage.input_tokens ?? 0;
+  const cacheRead = usage.cache_read_input_tokens ?? 0;
+  const outputTokens = usage.output_tokens ?? 0;
+  const numTurns = summary.numTurns ?? "?";
+  const secs = Math.floor((summary.durationMs ?? 0) / 1000);
+  const session = summary.sessionId ?? "none";
+  let footer = `[nano] model=${model} turns=${numTurns} tokens=${inputTokens + cacheRead}in/${outputTokens}out secs=${secs} session=${session}`;
+  if (Array.isArray(summary.permissionDenials) && summary.permissionDenials.length > 0) {
+    footer += ` denied=${formatDenials(summary.permissionDenials)}`;
+  }
+  return footer;
+}
+
+/**
+ * Truncate inline result text to `maxChars`, noting where the full output
+ * lives when a `jobId` is supplied.
+ */
+export function truncateInline(text, { maxChars = 8000, jobId = null } = {}) {
+  const value = String(text ?? "");
+  if (value.length <= maxChars) {
+    return { text: value, truncated: false };
+  }
+  const head = value.slice(0, maxChars).trimEnd();
+  const suffix = jobId ? `\n\n… truncated, full output: /nano:result ${jobId}` : `\n\n… truncated (${value.length} chars total)`;
+  return { text: head + suffix, truncated: true };
 }

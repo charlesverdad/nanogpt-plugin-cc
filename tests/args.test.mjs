@@ -43,6 +43,45 @@ test("parseArgs throws when a value option is missing its value", () => {
   );
 });
 
+test("parseArgs collects multi-value options across occurrences mixing forms", () => {
+  const { options, positionals } = parseArgs(
+    ['--allow-bash', 'npm test', '--allow-bash=ls', 'rest'],
+    { multiValueOptions: ['allow-bash'] },
+  );
+  assert.deepEqual(options['allow-bash'], ['npm test', 'ls']);
+  assert.deepEqual(positionals, ['rest']);
+});
+
+test("parseArgs supports short aliases for multi-value options", () => {
+  const { options } = parseArgs(
+    ['-a', 'rm', '-a', 'ls'],
+    { multiValueOptions: ['allow-bash'], aliasMap: { a: 'allow-bash' } },
+  );
+  assert.deepEqual(options['allow-bash'], ['rm', 'ls']);
+});
+
+test("parseArgs throws when a multi-value option is missing its value", () => {
+  assert.throws(
+    () => parseArgs(['--allow-bash'], { multiValueOptions: ['allow-bash'] }),
+    /Missing value for --allow-bash/,
+  );
+});
+
+test("parseArgs leaves an absent multi-value option undefined", () => {
+  const { options } = parseArgs(['pos'], { multiValueOptions: ['allow-bash'] });
+  assert.equal('allow-bash' in options, false);
+  assert.equal(options['allow-bash'], undefined);
+});
+
+test("parseArgs interacts with splitRawArgumentString for multi-value options", () => {
+  const tokens = splitRawArgumentString('--allow-bash "npm test" task text');
+  const { options, positionals } = parseArgs(tokens, {
+    multiValueOptions: ['allow-bash'],
+  });
+  assert.deepEqual(options['allow-bash'], ['npm test']);
+  assert.deepEqual(positionals, ['task', 'text']);
+});
+
 test("splitRawArgumentString respects quotes and escapes", () => {
   assert.deepEqual(
     splitRawArgumentString(`review "two words" 'single' plain`),
