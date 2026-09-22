@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# nano-agent: run a headless Claude Code agent on NanoGPT subscription models.
+#
+# usage: nano-agent [-m model] [-w] [-b 'cmd prefix']... [-r session_id] "task"
+#   -m  NanoGPT model id (default: $NANO_MODEL or z-ai/glm-5.2)
+#   -w  allow Edit/Write inside the current directory
+#   -b  allow Bash commands starting with this prefix, e.g. -b 'npm test' (repeatable)
+#   -r  resume a previous nano-agent session (id is printed in the footer)
+#
+# Read-only (Read/Glob/Grep) by default. --restricted ignores user/project
+# settings (so no hooks/plugins), confines file tools to the working directory
+# and protects settings/git files; anything not allowlisted is auto-denied
+# (dontAsk). Not --bare: bare mode drops Glob/Grep/Write regardless of --tools.
+# Prints the agent's final answer plus a one-line footer, and appends run
+# metrics to $NANO_AGENT_LOG.
+set -euo pipefail
+
+M="${NANO_MODEL:-z-ai/glm-5.2}"
+BUILTIN="Read,Glob,Grep"   # tools that exist at all (--tools)
+TOOLS="Read,Glob,Grep"     # tools that are pre-approved (--allowedTools)
+RESUME=()
+while getopts "m:wb:r:" o; do
+  case $o in
+    m) M=$OPTARG ;;
+    w) BUILTIN="$BUILTIN,Edit,Write"; TOOLS="$TOOLS,Edit(./**),Write(./**)" ;;
+    b) BUILTIN="${BUILTIN%,Bash},Bash"; TOOLS="$TOOLS,Bash($OPTARG:*)" ;;
+    r) RESUME=(--resume "$OPTARG") ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 1 ] || { echo "usage: nano-agent [-m model] [-w] [-b prefix]... [-r session] \"task\"" >&2; exit 2; }
+TASK=$1
+
+KEY="${NANOGPT_API_KEY:-$(security find-generic-password -s nanogpt-api-key -w)}"
+LOG="${NANO_AGENT_LOG:-$HOME/.local/state/nano-agent/runs.jsonl}"
+mkdir -p "$(dirname "$LOG")"
+
+OUT=$(env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_MODEL \
+  ANTHROPIC_BASE_URL=https://nano-gpt.com/api ANTHROPIC_API_KEY="$KEY" API_TIMEOUT_MS=600000 \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="$M" ANTHROPIC_DEFAULT_SONNET_MODEL="$M" ANTHROPIC_DEFAULT_HAIKU_MODEL="$M" \
+  claude --restricted --strict-mcp-config -p "$TASK" --model "$M" --tools="$BUILTIN" \
+    --permission-mode dontAsk --allowedTools="$TOOLS" \
+    --output-format json ${RESUME[@]+"${RESUME[@]}"} \
+  </dev/null 2> >(grep -vE 'unrecognized_model|claude.ai connectors are disabled' >&2)) || true
+
+if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$OUT"; then
+  printf '%s\n' "$OUT"
+  echo "[nano-agent] model=$M failed (no JSON result)" >&2
+  exit 1
+fi
+
+jq -r '.result // ""' <<<"$OUT"
+jq -r --arg m "$M" '"\n[nano-agent] model=\($m) turns=\(.num_turns) tokens=\(.usage.input_tokens + (.usage.cache_read_input_tokens // 0))in/\(.usage.output_tokens)out secs=\((.duration_ms // 0) / 1000 | floor) session=\(.session_id)"
+  + (if (.permission_denials | length) > 0
+     then " denied=" + ([.permission_denials[] | .tool_name + "(" + ((.tool_input.command // .tool_input.file_path // "") | tostring | if length > 60 then "…" + .[-59:] else . end) + ")"] | unique | join(", "))
+     else "" end)' <<<"$OUT"
+
+jq -c --arg m "$M" --arg tools "$TOOLS" --arg task "$TASK" --arg cwd "$PWD" \
+  '{ts: (now | todate), model: $m, cwd: $cwd, tools: $tools, is_error, turns: .num_turns,
+    in: .usage.input_tokens, cache_read: .usage.cache_read_input_tokens, out: .usage.output_tokens,
+    ms: .duration_ms, denials: (.permission_denials | length), session: .session_id, task: ($task | .[0:300])}' \
+  <<<"$OUT" >>"$LOG"
+
+jq -e '.is_error != true' >/dev/null <<<"$OUT"
