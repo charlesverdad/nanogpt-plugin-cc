@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {
   parseArgs,
   splitRawArgumentString,
-} from "../plugins/kimi/scripts/lib/args.mjs";
+} from "../plugins/nano/scripts/lib/args.mjs";
 
 test("parseArgs collects positionals and bare tokens", () => {
   const { options, positionals } = parseArgs(["build", "src", "-"]);

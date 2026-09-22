@@ -19,7 +19,7 @@ const TARGETS = [
     ]
   },
   {
-    file: "plugins/kimi/.claude-plugin/plugin.json",
+    file: "plugins/nano/.claude-plugin/plugin.json",
     values: [
       {
         label: "version",
@@ -42,7 +42,7 @@ const TARGETS = [
         }
       },
       {
-        label: "plugins[kimi].version",
+        label: "plugins[nano].version",
         get: (json) => findMarketplacePlugin(json).version,
         set: (json, version) => {
           findMarketplacePlugin(json).version = version;
@@ -112,8 +112,8 @@ function requireObject(value, label) {
 }
 
 function findMarketplacePlugin(json) {
-  const plugin = json.plugins?.find((entry) => entry?.name === "kimi");
-  requireObject(plugin, ".claude-plugin/marketplace.json plugins[kimi]");
+  const plugin = json.plugins?.find((entry) => entry?.name === "nano");
+  requireObject(plugin, ".claude-plugin/marketplace.json plugins[nano]");
   return plugin;
 }
 

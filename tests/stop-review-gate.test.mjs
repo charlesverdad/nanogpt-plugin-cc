@@ -5,11 +5,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { buildEnv, installFakeKimi } from "./fake-kimi-fixture.mjs";
+import { buildEnv, installFakeKimi } from "./fake-claude-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "kimi");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "nano");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const LIFECYCLE_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
 
@@ -113,7 +113,7 @@ test("Stop hook with gate enabled but kimi unavailable does not block", () => {
   // No block decision: the gate degrades to a stderr setup note.
   assert.equal(result.stdout.trim(), "");
   assert.match(result.stderr, /Kimi is not set up for the review gate/);
-  assert.match(result.stderr, /\/kimi:setup/);
+  assert.match(result.stderr, /\/nano:setup/);
 });
 
 // --- enabled gate, kimi available: review runs and parses output ------------
@@ -158,7 +158,7 @@ test("session-lifecycle hook writes the session id to CLAUDE_ENV_FILE on Session
 
   assert.equal(result.status, 0, result.stderr);
   const written = fs.readFileSync(envFile, "utf8");
-  assert.match(written, /KIMI_COMPANION_SESSION_ID='sess-xyz'/);
+  assert.match(written, /NANO_COMPANION_SESSION_ID='sess-xyz'/);
 });
 
 test("session-lifecycle hook handles SessionEnd without error (no jobs)", () => {

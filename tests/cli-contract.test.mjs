@@ -9,8 +9,8 @@ import {
   normalizeHelp,
   formatContractReport,
   HELP_ENV
-} from "../plugins/kimi/scripts/lib/cli-contract.mjs";
-import { runCommand } from "../plugins/kimi/scripts/lib/process.mjs";
+} from "../plugins/nano/scripts/lib/cli-contract.mjs";
+import { runCommand } from "../plugins/nano/scripts/lib/process.mjs";
 
 // A fake `kimi --help` fixture in the REAL Typer/Rich format: ANSI color escape
 // codes, Rich box-drawing borders, an "Options" panel where flags and their

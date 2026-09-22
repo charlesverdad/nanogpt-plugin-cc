@@ -1,9 +1,9 @@
 {
-  "name": "@moonshotai/kimi-plugin-cc",
-  "version": "1.0.1",
+  "name": "nanogpt-plugin-cc",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Use Kimi CLI from Claude Code to review code or delegate tasks.",
+  "description": "Hand off tasks and code reviews from Claude Code to NanoGPT subscription models.",
   "license": "MIT",
   "engines": {
     "node": ">=18.18.0"

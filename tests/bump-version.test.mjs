@@ -22,21 +22,21 @@ function makeVersionFixture() {
   const root = makeTempDir();
 
   writeJson(path.join(root, "package.json"), {
-    name: "@moonshotai/kimi-plugin-cc",
+    name: "nanogpt-plugin-cc",
     version: "1.0.0"
   });
-  writeJson(path.join(root, "plugins", "kimi", ".claude-plugin", "plugin.json"), {
-    name: "kimi",
+  writeJson(path.join(root, "plugins", "nano", ".claude-plugin", "plugin.json"), {
+    name: "nano",
     version: "1.0.0"
   });
   writeJson(path.join(root, ".claude-plugin", "marketplace.json"), {
-    name: "moonshotai-kimi",
+    name: "nanogpt-plugin-cc",
     metadata: {
       version: "1.0.0"
     },
     plugins: [
       {
-        name: "kimi",
+        name: "nano",
         version: "1.0.0"
       }
     ]
@@ -54,7 +54,7 @@ test("bump-version updates every release manifest", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(readJson(path.join(root, "package.json")).version, "1.2.3");
-  assert.equal(readJson(path.join(root, "plugins", "kimi", ".claude-plugin", "plugin.json")).version, "1.2.3");
+  assert.equal(readJson(path.join(root, "plugins", "nano", ".claude-plugin", "plugin.json")).version, "1.2.3");
   assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).metadata.version, "1.2.3");
   assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).plugins[0].version, "1.2.3");
 });
@@ -62,7 +62,7 @@ test("bump-version updates every release manifest", () => {
 test("bump-version check mode reports stale metadata", () => {
   const root = makeVersionFixture();
   writeJson(path.join(root, "package.json"), {
-    name: "@moonshotai/kimi-plugin-cc",
+    name: "nanogpt-plugin-cc",
     version: "1.0.1"
   });
 
@@ -71,6 +71,6 @@ test("bump-version check mode reports stale metadata", () => {
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /plugins\/kimi\/\.claude-plugin\/plugin\.json version/);
+  assert.match(result.stderr, /plugins\/nano\/\.claude-plugin\/plugin\.json version/);
   assert.match(result.stderr, /\.claude-plugin\/marketplace\.json metadata\.version/);
 });

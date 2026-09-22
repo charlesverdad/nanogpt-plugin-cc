@@ -1,0 +1,8 @@
+{
+  "name": "nano",
+  "version": "0.1.0",
+  "description": "Hand off tasks and code reviews from Claude Code to NanoGPT subscription models.",
+  "author": {
+    "name": "charlesverdad"
+  }
+}

@@ -1,21 +1,21 @@
 {
-  "name": "moonshotai-kimi",
+  "name": "nanogpt-plugin-cc",
   "owner": {
     "name": "charlesverdad"
   },
   "metadata": {
-    "description": "Kimi CLI plugin to use in Claude Code for delegation and code review.",
-    "version": "1.0.1"
+    "description": "Claude Code plugin that hands off tasks and code reviews to NanoGPT subscription models.",
+    "version": "0.1.0"
   },
   "plugins": [
     {
-      "name": "kimi",
-      "description": "Use Kimi CLI from Claude Code to review code or delegate tasks.",
-      "version": "1.0.1",
+      "name": "nano",
+      "description": "Hand off tasks and code reviews from Claude Code to NanoGPT subscription models.",
+      "version": "0.1.0",
       "author": {
         "name": "charlesverdad"
       },
-      "source": "./plugins/kimi"
+      "source": "./plugins/nano"
     }
   ]
 }
