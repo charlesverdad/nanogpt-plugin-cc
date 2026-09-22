@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,8 +15,34 @@ export function readJsonFile(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
+/**
+ * Writes `contents` to `filePath` without ever exposing a truncated or
+ * partially-written file to a concurrent reader. A plain `writeFileSync`
+ * truncates the target in place before writing it, so another process
+ * (another companion invocation, a detached worker, ...) can observe an
+ * empty or half-written file in between. Instead, write to a unique temp
+ * file in the same directory and `renameSync` it over the target: on POSIX
+ * (and on the single-volume case this project runs on) a rename is atomic,
+ * so readers always see either the old file or the fully-written new one.
+ */
+export function atomicWriteFileSync(filePath, contents, encoding = "utf8") {
+  const dir = path.dirname(filePath);
+  const tmpFile = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+  try {
+    fs.writeFileSync(tmpFile, contents, encoding);
+    fs.renameSync(tmpFile, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      // best-effort cleanup; the write failure is what matters
+    }
+    throw error;
+  }
+}
+
 export function writeJsonFile(filePath, value) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  atomicWriteFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 export function safeReadFile(filePath) {

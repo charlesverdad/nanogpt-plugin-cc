@@ -584,6 +584,33 @@ test("a background task passes the --max-turns cap on to the worker", () => {
   assert.equal(invocations[0].maxTurns, "9");
 });
 
+// Regression test for a cross-process race between enqueueBackgroundTask
+// (which used to spawn the detached worker before writing its job file/index
+// record) and the worker's first read of that same job by id: launching
+// several background jobs back to back used to be able to lose a job's
+// queued record, or hand the worker a job file that did not exist yet.
+test("5 background tasks launched back to back are all found by status --wait and complete, with exactly 5 fake invocations", () => {
+  const rt = setupRuntime("ok");
+
+  const jobIds = Array.from({ length: 5 }, (_, index) => {
+    const launch = runCompanion(rt, ["task", "--json", "--background", `Task number ${index}`]);
+    assert.equal(launch.status, 0, launch.stderr);
+    return JSON.parse(launch.stdout).jobId;
+  });
+  assert.equal(new Set(jobIds).size, 5, "expected 5 distinct job ids");
+
+  for (const jobId of jobIds) {
+    const waited = runCompanion(rt, ["status", jobId, "--wait", "--json", "--timeout-ms", "20000", "--poll-interval-ms", "200"]);
+    assert.equal(waited.status, 0, waited.stderr);
+    const snapshot = JSON.parse(waited.stdout);
+    assert.equal(snapshot.job.id, jobId);
+    assert.equal(snapshot.job.status, "completed", JSON.stringify(snapshot.job));
+  }
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 5);
+});
+
 test("task --continue does not carry an old --max-turns cap over", () => {
   const rt = setupRuntime("ok");
   const first = runCompanion(rt, ["task", "--json", "--max-turns", "3", "First task"]);

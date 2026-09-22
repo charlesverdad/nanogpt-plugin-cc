@@ -973,17 +973,30 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Write the job file and index record *before* spawning the worker. The
+  // worker's first act is to read this same job file by id (handleTaskWorker
+  // -> readStoredJob); spawning first raced the worker's read against this
+  // write and could start it before the job existed on disk at all ("No
+  // stored job found"). No pid yet: the worker isn't running until spawn
+  // below returns. Only after that succeeds do we patch the index with its
+  // pid - a minimal `{ id, pid }` upsert (not the full record) so it can
+  // never revert a status the worker has already reported through the lock
+  // that upsertJob/updateState now hold.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  if (child.pid != null) {
+    upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid });
+  }
 
   return {
     payload: {

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { atomicWriteFileSync } from "./fs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -10,6 +11,19 @@ const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+
+// updateState() (and everything built on it: upsertJob, setConfig) is the
+// only path allowed to read-modify-write state.json: it takes an
+// inter-process lock so the foreground CLI, a detached background worker and
+// `status`/`cancel` running concurrently can't clobber each other's writes.
+// loadState/listJobs/getConfig stay lock-free: atomicWriteFileSync's
+// rename-over-target means a reader always sees a whole file, never a torn
+// one, so there is nothing for the lock to protect on the read side.
+const STATE_LOCK_TIMEOUT_ENV = "NANO_STATE_LOCK_TIMEOUT_MS";
+const DEFAULT_STATE_LOCK_TIMEOUT_MS = 5000;
+const STATE_LOCK_STALE_MS = 30_000;
+const STATE_LOCK_RETRY_MIN_MS = 10;
+const STATE_LOCK_RETRY_MAX_MS = 25;
 
 function nowIso() {
   return new Date().toISOString();
@@ -146,14 +160,122 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  atomicWriteFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
+function resolveStateLockTimeoutMs() {
+  const raw = process.env[STATE_LOCK_TIMEOUT_ENV];
+  const parsed = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_STATE_LOCK_TIMEOUT_MS;
+}
+
+function resolveStateLockDir(cwd) {
+  return `${resolveStateFile(cwd)}.lock`;
+}
+
+/**
+ * Synchronous sleep for the lock's retry loop. `updateState` is called from
+ * synchronous code paths all over the CLI (including inside `mutate`
+ * callbacks that must not become async), so this blocks the event loop for
+ * `ms` via Atomics.wait rather than returning a Promise.
+ */
+function sleepSync(ms) {
+  if (ms <= 0) {
+    return;
+  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function randomRetryDelayMs() {
+  return STATE_LOCK_RETRY_MIN_MS + Math.floor(Math.random() * (STATE_LOCK_RETRY_MAX_MS - STATE_LOCK_RETRY_MIN_MS + 1));
+}
+
+/** Removes `lockDir` if it is older than STATE_LOCK_STALE_MS. Returns whether it broke a lock. */
+function breakStaleLock(lockDir) {
+  let stat;
+  try {
+    stat = fs.statSync(lockDir);
+  } catch {
+    // Already gone (released by its owner, or raced away by another waiter).
+    return false;
+  }
+  if (Date.now() - stat.mtimeMs < STATE_LOCK_STALE_MS) {
+    return false;
+  }
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Acquires the cross-process lock that guards state.json's
+ * load-mutate-save cycle. `fs.mkdirSync` on a not-yet-existing path is
+ * atomic (only one caller ever wins EEXIST across processes), so an empty
+ * directory next to state.json doubles as the lock. Retries with a
+ * synchronous sleep until `timeoutMs` elapses, breaking any lock whose mtime
+ * is older than STATE_LOCK_STALE_MS (its owner almost certainly crashed or
+ * was killed while holding it).
+ */
+function acquireStateLock(cwd) {
+  ensureStateDir(cwd);
+  const lockDir = resolveStateLockDir(cwd);
+  const timeoutMs = resolveStateLockTimeoutMs();
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir);
+      return lockDir;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    if (breakStaleLock(lockDir)) {
+      continue;
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timed out after ${timeoutMs}ms waiting for the nano-companion state lock at ${lockDir}. ` +
+          "Another nano-companion process may be stuck; delete that directory if it is not."
+      );
+    }
+
+    sleepSync(Math.min(randomRetryDelayMs(), Math.max(0, deadline - Date.now())));
+  }
+}
+
+function releaseStateLock(lockDir) {
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  } catch {
+    // Best effort: a stale/missing lock dir is handled by breakStaleLock.
+  }
+}
+
+/**
+ * The only supported way to read-modify-write state.json. Holds the
+ * cross-process lock for the whole load-mutate-save cycle (saveState's
+ * pruned-job file/log cleanup included) so two processes racing to update
+ * jobs or config can never produce a lost update. `mutate` must be
+ * synchronous and must not itself call updateState/upsertJob/setConfig -
+ * the lock is not re-entrant.
+ */
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  const lockDir = acquireStateLock(cwd);
+  try {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveState(cwd, state);
+  } finally {
+    releaseStateLock(lockDir);
+  }
 }
 
 export function generateJobId(prefix = "job") {
@@ -201,7 +323,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  atomicWriteFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
