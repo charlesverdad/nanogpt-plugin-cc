@@ -26,4 +26,4 @@ The `--model` option accepts a model id or alias (`default`, `heavy`, `alt`, `fa
 
 When presenting the allowlist or a suggestion to extend it, pass on this risk: an allowlisted prefix runs with any arguments and the user's permissions. Any command that runs repository code (test runners, build tools, package scripts such as `npm test`) or takes an output-file option lets the NanoGPT model write or execute anything, because it can edit that code or config first. Only Edit/Write are confined to the working directory and kept out of `.git`.
 
-The stop-time review gate is optional and off by default. Pass `--enable-review-gate` to require a fresh NanoGPT review before a session can stop, or `--disable-review-gate` to turn it back off.
+The stop-time review gate is opt-in and off by default. Pass `--enable-review-gate` to require a fresh NanoGPT review before a session can stop, or `--disable-review-gate` to turn it back off. Be aware: when it is on, it runs a NanoGPT review every time a Claude session stops, which uses weekly quota every time.

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Verify that an installed `claude` (Claude Code) CLI still exposes the command
-// surface this plugin depends on, by parsing `claude --help`, and that its
-// version meets the plugin's minimum.
+// surface this plugin depends on, by parsing `claude --help`, probing flags that
+// are hidden from --help (e.g. --max-turns) with a minimal offline run, and
+// checking that its version meets the plugin's minimum.
 //
 // Usage:
 //   node plugins/nano/scripts/check-cli-contract.mjs
@@ -24,6 +25,10 @@ import {
   REQUIRED_COMMANDS,
   verifyContract,
   formatContractReport,
+  verifyHiddenFlags,
+  formatHiddenFlagsReport,
+  buildHiddenFlagProbeArgv,
+  hiddenFlagProbeEnv,
   HELP_ENV
 } from "./lib/cli-contract.mjs";
 import {
@@ -66,6 +71,23 @@ function getClaudeVersion() {
   return `${result.stdout ?? ""}${result.stderr ?? ""}`.trim() || "unknown";
 }
 
+/**
+ * Probe one hidden flag by execution: `claude -p <flag> 1 --output-format
+ * json --tools=Read -- ping` against an unreachable offline endpoint (see
+ * hiddenFlagProbeEnv). Returns the raw runCommand result; verifyHiddenFlags
+ * only inspects stderr for commander's "unknown option" rejection.
+ */
+function runHiddenFlagProbe(flag) {
+  const result = runCommand("claude", buildHiddenFlagProbeArgv(flag), {
+    maxBuffer: 10 * 1024 * 1024,
+    env: hiddenFlagProbeEnv(process.env)
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  return result;
+}
+
 function main() {
   if (!claudeOnPath()) {
     process.stderr.write(
@@ -103,7 +125,14 @@ function main() {
     `${formatContractReport(verification, `claude CLI contract (claude ${parsedVersion})`)}\n`
   );
 
-  if (!verification.ok) {
+  // Hidden flags (e.g. --max-turns) are absent from --help, so they are
+  // probed by execution after the help-based checks.
+  const hiddenVerification = verifyHiddenFlags(runHiddenFlagProbe);
+  process.stdout.write(
+    `${formatHiddenFlagsReport(hiddenVerification, `claude hidden flags (claude ${parsedVersion})`)}\n`
+  );
+
+  if (!verification.ok || !hiddenVerification.ok) {
     process.stderr.write(
       "\nERROR: installed Claude Code is missing command surface the plugin depends on.\n"
     );

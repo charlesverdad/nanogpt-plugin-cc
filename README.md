@@ -2,7 +2,7 @@
 
 Use NanoGPT subscription models from inside Claude Code for code reviews or to delegate tasks.
 
-This plugin is for Claude Code users who have a NanoGPT subscription and want to push well-scoped work — bug investigations, mechanical fixes, code reviews — onto subscription-included open-weight models (GLM, DeepSeek, Qwen, MiniMax, and others) from the workflow they already have. Calls to subscription-included models cost $0 per call and count against a weekly token quota. The UX mirrors the kimi and codex plugins: slash commands, background jobs, and a thin forwarding subagent.
+This plugin is for Claude Code users who have a NanoGPT subscription and want to push well-scoped work — bug investigations, mechanical fixes, code reviews — onto subscription-included open-weight models (GLM, DeepSeek, Qwen, MiniMax, and others) from the workflow they already have. Calls to subscription-included models are included in the subscription, but every call counts against a weekly input-token quota, cached input included. `/nano:rescue` only ever runs when you explicitly ask for it (via the command or by telling Claude to hand work to NanoGPT); Claude does not reach for it on its own. The UX mirrors the kimi and codex plugins: slash commands, background jobs, and a thin forwarding subagent.
 
 ## How It Works
 
@@ -85,10 +85,10 @@ The key is resolved fresh for each run and is never written to job files, logs, 
 ### /nano:rescue
 
 ```
-/nano:rescue [--background|--wait] [--continue|--fresh] [--model <id|alias>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] <task>
+/nano:rescue [--background|--wait] [--continue|--fresh] [--model <id|alias>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] <task>
 ```
 
-Hands a task to NanoGPT through the `nano:nano-rescue` subagent. Use it to investigate a bug, try a fix, or continue a previous NanoGPT session. By default the task runs in the foreground; use `--background` to run it as a background job.
+Hands a task to NanoGPT through the `nano:nano-rescue` subagent. **This only ever runs when you ask for it** — by name (`/nano:rescue`) or by telling Claude to hand something to NanoGPT; Claude does not use it proactively, and it is meant for short, well-scoped tasks. Use it to investigate a bug, try a fix, or continue a previous NanoGPT session. By default the task runs in the foreground; use `--background` to run it as a background job.
 
 - `--background` / `--wait` — run as a background job or wait in the foreground (default: foreground).
 - `--continue` / `--fresh` — resume the latest NanoGPT task for this repo, or start a new session. If neither is given, the plugin offers to continue the latest task.
@@ -97,6 +97,7 @@ Hands a task to NanoGPT through the `nano:nano-rescue` subagent. Use it to inves
 - `--read-only` — run with the `read` permission profile (no Edit, Write, or Bash).
 - `--allow-bash <prefix>` — add a Bash prefix to the allowlist for this run (repeatable). The command then runs with any arguments; see [Permission Profiles](#permission-profiles) for the risk.
 - `--allow-paid` — allow a non-subscription (pay-per-token) model. Refused otherwise.
+- `--max-turns <n>` — cap the run at `n` turns (1-500, default 25). See [Turn Caps](#turn-caps) below.
 
 Examples:
 
@@ -111,18 +112,18 @@ Examples:
 ### /nano:review
 
 ```
-/nano:review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]
+/nano:review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-turns <n>]
 ```
 
-Runs a read-only NanoGPT review on your current uncommitted changes or your branch compared to a base ref. The NanoGPT model can read files but cannot edit them or run commands. It is not steerable and does not take focus text. Use `--base <ref>` for branch review. `--scope` defaults to `auto`.
+Runs a read-only NanoGPT review on your current uncommitted changes or your branch compared to a base ref. The NanoGPT model can read files but cannot edit them or run commands. It is not steerable and does not take focus text. Use `--base <ref>` for branch review. `--scope` defaults to `auto`. `--max-turns <n>` caps the review at `n` turns (default 15); reviews are read-only and rarely need more.
 
 ### /nano:adversarial-review
 
 ```
-/nano:adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]
+/nano:adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-turns <n>] [focus ...]
 ```
 
-Runs a steerable review that questions the chosen implementation, design tradeoffs, and assumptions. Like `/nano:review`, it is read-only: the NanoGPT model can read files but cannot edit them or run commands. It uses the same target selection as `/nano:review` and additionally accepts focus text after the flags. Use it to pressure-test specific risk areas like auth, data loss, race conditions, or rollback.
+Runs a steerable review that questions the chosen implementation, design tradeoffs, and assumptions. Like `/nano:review`, it is read-only: the NanoGPT model can read files but cannot edit them or run commands. It uses the same target selection as `/nano:review` and additionally accepts focus text after the flags. `--max-turns <n>` caps the review at `n` turns (default 15). Use it to pressure-test specific risk areas like auth, data loss, race conditions, or rollback.
 
 ### /nano:setup
 
@@ -135,7 +136,7 @@ Checks readiness and optionally configures workspace defaults.
 - `--model <id|alias>` — set the workspace default model.
 - `--allow-bash <prefix>` — add a Bash prefix to the workspace allowlist (repeatable). A prefix that runs repo code (e.g. `npm test`) lets the model execute anything; see [Permission Profiles](#permission-profiles).
 - `--disallow-bash <prefix>` — remove a Bash prefix from the workspace allowlist (repeatable).
-- `--enable-review-gate` / `--disable-review-gate` — toggle the stop-time review gate, which requires a fresh NanoGPT review before a session can stop. Off by default.
+- `--enable-review-gate` / `--disable-review-gate` — toggle the stop-time review gate, which requires a fresh NanoGPT review before a session can stop. **Opt-in and off by default.** When it is on, it runs a NanoGPT review every time a Claude session stops, and each of those reviews uses weekly quota.
 
 ### /nano:status
 
@@ -206,6 +207,23 @@ You can also add a prefix for a single run:
 /nano:rescue --allow-bash "npm test" fix the failing test
 ```
 
+## Turn Caps
+
+Every run is capped at a fixed number of conversational turns, so a task or review can't loop indefinitely and quietly burn quota. Each turn resends the whole conversation so far, so an uncapped multi-turn run can use far more quota than intended.
+
+- `rescue` / `task`: `--max-turns <n>`, default 25.
+- `review` and `adversarial-review`: `--max-turns <n>`, default 15.
+- `n` must be an integer from 1 to 500; an invalid value exits 1 before anything is invoked.
+- The stop-time review gate (see below) always uses 15.
+
+When a run hits its cap, `claude` exits 1 with a normal result whose `subtype` is `error_max_turns`. The plugin renders this as its own outcome, not a generic failure:
+
+```
+Stopped at the turn limit (25 turns) before finishing. Continue where it left off with --continue, or rerun with a higher --max-turns.
+```
+
+The JSON payload for that run has `stopReason: "max_turns"` and `maxTurns: <n>`. The NanoGPT/Claude session id is still recorded, so `/nano:rescue --continue` (or `task --continue`) resumes exactly where it stopped; a background job that hits the cap is marked `failed` with the same message. `--continue` never carries a previous run's `--max-turns` over — it uses the new run's flag, or the default.
+
 ## Models
 
 | Alias | Model id |
@@ -218,6 +236,8 @@ You can also add a prefix for a single run:
 The workspace default is set with `/nano:setup --model <id|alias>` and stored in plugin state.
 
 **Quota multipliers:** `z-ai/glm-5.3` and `deepseek/deepseek-v4-pro` count input tokens at 2x against your weekly quota. A one-line warning is printed when the multiplier is greater than 1.
+
+**Cached input counts in full:** the weekly quota counts every input token, and prompt-cache hits aren't discounted. Each turn of a task resends the conversation so far, so a long multi-turn `/nano:rescue` task uses far more quota than a review or a one-shot question. Keep delegated tasks short and well scoped.
 
 **Thinking mode:** `--thinking` selects the `<model>:thinking` variant when it exists in the catalog. If no thinking variant exists, a warning is printed and the base model runs.
 
@@ -241,10 +261,21 @@ Every run ends with a footer line in this format, with raw integer token counts 
 [nano] model=z-ai/glm-5.2 turns=4 tokens=31240in/1187out secs=21 session=0b6f…
 ```
 
+Around every run where a key resolved, the plugin takes a NanoGPT weekly-usage snapshot just before and just after the run and appends `quota=+<delta> week=<percent>%`, for example:
+
+```
+[nano] model=z-ai/glm-5.2 turns=4 tokens=31240in/1187out secs=21 session=0b6f… quota=+1.2M week=24%
+```
+
+- `quota=+<delta>` is the change in your NanoGPT weekly usage across the run (`weeklyUsed` after minus before), abbreviated like `1.2M`. Because it's measured from the account's weekly usage rather than only this run's own token counts, it also reflects any other run that used quota concurrently (another background job, a review, the stop gate, etc.).
+- `week=<percent>%` is how full your weekly quota window is right after the run.
+- Both parts are omitted when the usage snapshot could not be read (for example, offline tests point `NANOGPT_BASE_URL` at an unreachable address, so no quota part appears there) or a value is not computable. A drop in weekly usage (only possible from a weekly reset happening mid-run) is treated as unknown and `quota=` is omitted.
+- The same `quota` object (`{ delta, weeklyUsed, weeklyLimit, weekPercent }`) is in the `task`/`review` JSON payload and the metrics log (`runs.jsonl`, as `quotaDelta`). A failed or slow usage fetch never fails the run.
+
 When tool calls were denied, the footer ends with `denied=` and the denied tool plus detail, for example:
 
 ```
-[nano] model=z-ai/glm-5.2 turns=4 tokens=31240in/1187out secs=21 session=0b6f… denied=Bash(rm -rf build)
+[nano] model=z-ai/glm-5.2 turns=4 tokens=31240in/1187out secs=21 session=0b6f… quota=+1.2M week=24% denied=Bash(rm -rf build)
 ```
 
 | Field | Meaning |
@@ -254,13 +285,15 @@ When tool calls were denied, the footer ends with `denied=` and the denied tool 
 | `tokens` | Input tokens (including cache reads) and output tokens, as raw integers. |
 | `secs` | Wall-clock duration in seconds. |
 | `session` | The Claude Code session id (used by `--continue` to resume). |
+| `quota` | Present only when a usage snapshot succeeded. The change in weekly quota used by this run (and any concurrent run), abbreviated. |
+| `week` | Present only when computable. How full the weekly quota window is right after the run, as a percent. |
 | `denied` | Present only when tool calls were denied. Lists the denied tool and detail, e.g. `Bash(rm -rf build)`. Rerun with `--allow-bash` to grant the command. |
 
 Run metrics are appended as one JSON line per run to `${CLAUDE_PLUGIN_DATA}/runs.jsonl` (falling back to `$TMPDIR/nano-companion-<uid>/runs.jsonl`, a per-user directory kept at mode 0700; job state and the model catalog cache use the same fallback).
 
 ## Calling the Companion Directly
 
-The main Claude thread may run the companion script directly via Bash, skipping the forwarding subagent when you want the cheapest path:
+The main Claude thread may run the companion script directly via Bash, skipping the forwarding subagent — but only when you explicitly asked for NanoGPT. This is never the default; Claude should not route work to NanoGPT on its own initiative.
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/nano-companion.mjs" task ...

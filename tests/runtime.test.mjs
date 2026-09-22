@@ -458,6 +458,9 @@ test("task --json payload has the documented shape", () => {
       "permissionDenials",
       "numTurns",
       "durationMs",
+      "quota",
+      "stopReason",
+      "maxTurns",
       "stderr",
       "warnings",
       "footer"
@@ -474,6 +477,11 @@ test("task --json payload has the documented shape", () => {
   assert.deepEqual(payload.permissionDenials, []);
   assert.equal(payload.numTurns, 3);
   assert.equal(typeof payload.durationMs, "number");
+  // The base URL is unreachable (http://127.0.0.1:9), so the quota snapshot
+  // fails fast and quota is null; the run did not hit the turn cap.
+  assert.equal(payload.quota, null);
+  assert.equal(payload.stopReason, null);
+  assert.equal(payload.maxTurns, 25);
   assert.equal(payload.stderr, "");
   assert.match(payload.footer, /^\[nano\] model=z-ai\/glm-5\.2/);
 });
@@ -502,11 +510,166 @@ test("a task run appends one runs.jsonl line with the nano-agent field names", (
     "ms",
     "denials",
     "session",
+    "quotaDelta",
     "task"
   ]);
   assert.equal(entry.model, "z-ai/glm-5.2");
   assert.equal(entry.cwd, rt.repoDir);
   assert.equal(entry.is_error, false);
+  // The base URL is unreachable (http://127.0.0.1:9), so the quota snapshot
+  // fails fast and quotaDelta is null.
+  assert.equal(entry.quotaDelta, null);
+});
+
+// --- turn caps: defaults, overrides, invalid values, background, --continue ---
+
+test("a task passes --max-turns 25 by default", () => {
+  const rt = setupRuntime("ok");
+  const result = runCompanion(rt, ["task", "--json", "Do a thing"]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].maxTurns, "25");
+});
+
+test("review and adversarial-review pass --max-turns 15 by default", () => {
+  const rt = setupRuntime("ok");
+  commitInitial(rt.repoDir);
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const x = 1;\n", "utf8");
+
+  const review = runCompanion(rt, ["review", "--json", "--scope", "working-tree"]);
+  assert.equal(review.status, 0, review.stderr);
+  let invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].maxTurns, "15");
+
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const x = 2;\n", "utf8");
+  const adversarial = runCompanion(rt, ["adversarial-review", "--json", "--scope", "working-tree"]);
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 2);
+  assert.equal(invocations[1].maxTurns, "15");
+});
+
+test("--max-turns 7 overrides the task default", () => {
+  const rt = setupRuntime("ok");
+  const result = runCompanion(rt, ["task", "--json", "--max-turns", "7", "Do a thing"]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].maxTurns, "7");
+});
+
+test("an invalid --max-turns exits 1 with no claude invocation", () => {
+  const rt = setupRuntime("ok");
+  const result = runCompanion(rt, ["task", "--json", "--max-turns", "0", "Do a thing"]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Invalid --max-turns/);
+  assert.equal(fs.existsSync(rt.invocationsLog), false, "claude must never be invoked for an invalid --max-turns");
+});
+
+test("a background task passes the --max-turns cap on to the worker", () => {
+  const rt = setupRuntime("ok");
+  const launch = runCompanion(rt, ["task", "--json", "--background", "--max-turns", "9", "Refactor the parser"]);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const waited = runCompanion(rt, ["status", jobId, "--wait", "--json", "--timeout-ms", "20000", "--poll-interval-ms", "200"]);
+  assert.equal(waited.status, 0, waited.stderr);
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].maxTurns, "9");
+});
+
+// Regression test for a cross-process race between enqueueBackgroundTask
+// (which used to spawn the detached worker before writing its job file/index
+// record) and the worker's first read of that same job by id: launching
+// several background jobs back to back used to be able to lose a job's
+// queued record, or hand the worker a job file that did not exist yet.
+test("5 background tasks launched back to back are all found by status --wait and complete, with exactly 5 fake invocations", () => {
+  const rt = setupRuntime("ok");
+
+  const jobIds = Array.from({ length: 5 }, (_, index) => {
+    const launch = runCompanion(rt, ["task", "--json", "--background", `Task number ${index}`]);
+    assert.equal(launch.status, 0, launch.stderr);
+    return JSON.parse(launch.stdout).jobId;
+  });
+  assert.equal(new Set(jobIds).size, 5, "expected 5 distinct job ids");
+
+  for (const jobId of jobIds) {
+    const waited = runCompanion(rt, ["status", jobId, "--wait", "--json", "--timeout-ms", "20000", "--poll-interval-ms", "200"]);
+    assert.equal(waited.status, 0, waited.stderr);
+    const snapshot = JSON.parse(waited.stdout);
+    assert.equal(snapshot.job.id, jobId);
+    assert.equal(snapshot.job.status, "completed", JSON.stringify(snapshot.job));
+  }
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 5);
+});
+
+test("task --continue does not carry an old --max-turns cap over", () => {
+  const rt = setupRuntime("ok");
+  const first = runCompanion(rt, ["task", "--json", "--max-turns", "3", "First task"]);
+  assert.equal(first.status, 0, first.stderr);
+
+  const second = runCompanion(rt, ["task", "--json", "--continue", "Second task"]);
+  assert.equal(second.status, 0, second.stderr);
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 2);
+  assert.equal(invocations[0].maxTurns, "3");
+  // --continue uses this run's flag (none given here) or the default, never
+  // the previous run's cap.
+  assert.equal(invocations[1].maxTurns, "25");
+});
+
+// --- turn caps: hitting the limit ----------------------------------------------
+
+test("a task exits 1 with the turn-limit message and stopReason max_turns", () => {
+  const rt = setupRuntime("max-turns");
+  const result = runCompanion(rt, ["task", "--json", "Do a big thing"]);
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.stopReason, "max_turns");
+  assert.equal(payload.maxTurns, 25);
+  assert.equal(payload.isError, true);
+
+  const rendered = runCompanion(rt, ["task", "Do a big thing"]);
+  assert.equal(rendered.status, 1);
+  assert.match(rendered.stdout, /Stopped at the turn limit \(25 turns\) before finishing\./);
+});
+
+test("a background job that hits the turn cap ends failed with the turn-limit message", () => {
+  const rt = setupRuntime("max-turns");
+  const launch = runCompanion(rt, ["task", "--json", "--background", "Do a big thing"]);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const waited = runCompanion(rt, ["status", jobId, "--wait", "--json", "--timeout-ms", "20000", "--poll-interval-ms", "200"]);
+  assert.equal(waited.status, 0, waited.stderr);
+  const snapshot = JSON.parse(waited.stdout);
+  assert.equal(snapshot.job.status, "failed");
+  assert.match(snapshot.job.summary, /Stopped at the turn limit \(25 turns\)/);
+});
+
+test("task --continue resumes a job that stopped at the turn limit", () => {
+  const rt = setupRuntime("max-turns");
+  const first = runCompanion(rt, ["task", "--json", "First task"]);
+  assert.equal(first.status, 1);
+  const firstPayload = JSON.parse(first.stdout);
+  assert.ok(firstPayload.claudeSessionId, "a max-turns stop still records a session id");
+
+  const second = runCompanion(rt, ["task", "--json", "--continue", "Second task"]);
+  assert.equal(second.status, 1, second.stderr);
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 2);
+  assert.equal(invocations[1].resume, firstPayload.claudeSessionId);
 });
 
 // --- task: --continue ---------------------------------------------------------

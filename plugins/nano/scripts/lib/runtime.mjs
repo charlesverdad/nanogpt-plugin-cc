@@ -20,6 +20,13 @@ export const KEY_SETUP_COMMAND = 'security add-generic-password -a "$USER" -s na
 export const MIN_CLAUDE_VERSION = "2.1.278";
 export const API_TIMEOUT_MS = "600000";
 
+// Default turn caps. NanoGPT's weekly quota counts every input token,
+// including prompt-cache reads, and each turn resends the whole conversation,
+// so unbounded multi-turn runs burn quota fast.
+export const DEFAULT_TASK_MAX_TURNS = 25;
+export const DEFAULT_REVIEW_MAX_TURNS = 15;
+export const MAX_TURNS_LIMIT = 500;
+
 // Host settings that would route the child to a different provider or a paid
 // Claude model. They are removed before ours are applied.
 export const STRIPPED_ENV_VARS = Object.freeze([
@@ -199,11 +206,35 @@ export function buildPermissionProfile(profile, options = {}) {
 }
 
 /**
+ * Normalize a `--max-turns` value (from the CLI it arrives as a string) to an
+ * integer between 1 and MAX_TURNS_LIMIT. Returns null for null/undefined and
+ * throws a clear error for anything else.
+ */
+export function normalizeMaxTurns(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const n = typeof value === "number" ? value : Number(String(value).trim());
+  if (!Number.isInteger(n) || n < 1 || n > MAX_TURNS_LIMIT) {
+    throw new Error(`Invalid --max-turns "${value}": expected an integer between 1 and ${MAX_TURNS_LIMIT}.`);
+  }
+  return n;
+}
+
+// True when a claude result stopped because it hit the --max-turns cap
+// (subtype "error_max_turns" / terminal_reason "max_turns", exit 1).
+export function isMaxTurnsStop(summary) {
+  return Boolean(summary) && (summary.terminalReason === "max_turns" || summary.subtype === "error_max_turns");
+}
+
+/**
  * Build the `claude` argv. Variadic flags (`--tools`, `--allowedTools`) always
  * use the `--flag=value` form so they cannot swallow other arguments, and the
  * prompt goes last after `--` so a prompt that starts with "-" is not parsed as
  * an option. With `promptViaStdin` the prompt is omitted and must be written to
  * the child's stdin instead (for prompts too large for a single argv entry).
+ * `maxTurns` (null = no cap flag) adds `--max-turns <n>` right after
+ * `--strict-mcp-config`.
  */
 export function buildClaudeArgs({
   prompt,
@@ -212,7 +243,8 @@ export function buildClaudeArgs({
   bashAllow,
   resumeSessionId = null,
   outputFormat = "json",
-  promptViaStdin = false
+  promptViaStdin = false,
+  maxTurns = null
 } = {}) {
   if (!model) {
     throw new Error("buildClaudeArgs requires a model.");
@@ -223,12 +255,14 @@ export function buildClaudeArgs({
   if (!OUTPUT_FORMATS.includes(outputFormat)) {
     throw new Error(`Unsupported output format "${outputFormat}".`);
   }
+  const maxTurnsValue = normalizeMaxTurns(maxTurns);
   const permissions = typeof profile === "object" ? profile : buildPermissionProfile(profile, { bashAllow });
 
   const args = [
     "-p",
     "--restricted",
     "--strict-mcp-config",
+    ...(maxTurnsValue !== null ? ["--max-turns", String(maxTurnsValue)] : []),
     "--model",
     model,
     `--tools=${permissions.tools.join(",")}`,
@@ -461,7 +495,7 @@ export function resolveRunLogFile(env = process.env) {
   return path.join(env.CLAUDE_PLUGIN_DATA || resolveFallbackDataDir(), "runs.jsonl");
 }
 
-export function buildRunLogEntry({ model, cwd, allowedTools = [], task = "", summary, now = new Date() }) {
+export function buildRunLogEntry({ model, cwd, allowedTools = [], task = "", summary, quotaDelta = null, now = new Date() }) {
   return {
     ts: now.toISOString(),
     model,
@@ -475,6 +509,7 @@ export function buildRunLogEntry({ model, cwd, allowedTools = [], task = "", sum
     ms: summary.durationMs,
     denials: summary.permissionDenials.length,
     session: summary.sessionId,
+    quotaDelta,
     task: String(task).slice(0, 300)
   };
 }

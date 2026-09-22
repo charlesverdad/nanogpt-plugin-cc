@@ -5,7 +5,8 @@ import {
   pingNanoGpt,
   fetchSubscriptionUsage,
   formatTokenCount,
-  describeSubscription
+  describeSubscription,
+  buildRunQuota
 } from "../plugins/nano/scripts/lib/account.mjs";
 
 const BASE_URL = "https://nano-gpt.com/api";
@@ -357,4 +358,50 @@ test("describeSubscription: ok but inactive -> 'inactive'", () => {
     detail: "HTTP 200"
   };
   assert.equal(describeSubscription(usage), "inactive");
+});
+
+// ---------------------------------------------------------------------------
+// buildRunQuota
+// ---------------------------------------------------------------------------
+
+test("buildRunQuota: both snapshots ok -> delta and weekPercent computed", () => {
+  const before = { ok: true, weeklyUsed: 1_000_000, weeklyLimit: 60_000_000 };
+  const after = { ok: true, weeklyUsed: 2_200_000, weeklyLimit: 60_000_000 };
+  const quota = buildRunQuota(before, after);
+  assert.deepEqual(quota, {
+    delta: 1_200_000,
+    weeklyUsed: 2_200_000,
+    weeklyLimit: 60_000_000,
+    weekPercent: 4
+  });
+});
+
+test("buildRunQuota: before snapshot failed -> delta null, weekPercent still computed", () => {
+  const before = { ok: false };
+  const after = { ok: true, weeklyUsed: 2_200_000, weeklyLimit: 60_000_000 };
+  const quota = buildRunQuota(before, after);
+  assert.equal(quota.delta, null);
+  assert.equal(quota.weeklyUsed, 2_200_000);
+  assert.equal(quota.weekPercent, 4);
+});
+
+test("buildRunQuota: after snapshot failed -> null (never fails the run)", () => {
+  assert.equal(buildRunQuota({ ok: true, weeklyUsed: 1000 }, { ok: false }), null);
+  assert.equal(buildRunQuota({ ok: true, weeklyUsed: 1000 }, null), null);
+  assert.equal(buildRunQuota(null, { ok: false }), null);
+});
+
+test("buildRunQuota: zero weeklyLimit -> weekPercent null (no divide by zero)", () => {
+  const before = { ok: true, weeklyUsed: 0, weeklyLimit: 0 };
+  const after = { ok: true, weeklyUsed: 0, weeklyLimit: 0 };
+  const quota = buildRunQuota(before, after);
+  assert.equal(quota.weekPercent, null);
+  assert.equal(quota.delta, 0);
+});
+
+test("buildRunQuota: a negative delta is preserved (weekly reset mid-run)", () => {
+  const before = { ok: true, weeklyUsed: 50_000_000, weeklyLimit: 60_000_000 };
+  const after = { ok: true, weeklyUsed: 100_000, weeklyLimit: 60_000_000 };
+  const quota = buildRunQuota(before, after);
+  assert.equal(quota.delta, -49_900_000);
 });

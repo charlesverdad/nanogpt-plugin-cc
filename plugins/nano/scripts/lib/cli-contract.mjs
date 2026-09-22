@@ -93,6 +93,105 @@ export const HELP_ENV = Object.freeze({
 });
 
 /**
+ * Flags the plugin depends on that are hidden from `claude --help`, so the
+ * help-text contract above cannot see them. They are probed by execution
+ * instead: `claude -p <flag> 1 ... -- ping` against an unreachable offline
+ * endpoint. A flag that the installed claude no longer knows fails commander
+ * argument parsing with `error: unknown option '<flag>'` on stderr; any other
+ * failure (network, auth) is fine, because it means the flag was accepted.
+ */
+export const HIDDEN_FLAGS = Object.freeze([
+  { flag: "--max-turns", note: "buildClaudeArgs() passes --max-turns <n> (turn cap; hidden from --help)" }
+]);
+
+/**
+ * The argv used to probe one hidden flag: a minimal headless run with a tiny
+ * turn cap against a prompt of "ping".
+ */
+export function buildHiddenFlagProbeArgv(flag) {
+  return ["-p", flag, "1", "--output-format", "json", "--tools=Read", "--", "ping"];
+}
+
+/**
+ * Environment for the hidden-flag probe: HELP_ENV plus an unreachable base
+ * URL and a non-key so the probe is offline and fast (3s API timeout, no
+ * retries). ANTHROPIC_AUTH_TOKEN is removed so a host token cannot route the
+ * probe somewhere real.
+ */
+export function hiddenFlagProbeEnv(baseEnv = process.env) {
+  const env = {
+    ...baseEnv,
+    ...HELP_ENV,
+    ANTHROPIC_BASE_URL: "http://127.0.0.1:9",
+    ANTHROPIC_API_KEY: "contract-probe-not-a-key",
+    API_TIMEOUT_MS: "3000",
+    CLAUDE_CODE_MAX_RETRIES: "0"
+  };
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  return env;
+}
+
+/**
+ * Verify the hidden flags by execution. `runProbe(flag)` runs
+ * buildHiddenFlagProbeArgv(flag) against the real (or fake) claude and returns
+ * `{ status, stdout, stderr }`; it may throw. A flag fails when the probe's
+ * stderr matches /unknown option/ (commander rejected the flag) or the probe
+ * itself could not run.
+ *
+ * @returns {{ ok: boolean, checks: Array, missing: Array }}
+ */
+export function verifyHiddenFlags(runProbe, options = {}) {
+  const flags = options.flags ?? HIDDEN_FLAGS;
+  const checks = [];
+  const missing = [];
+
+  for (const entry of flags) {
+    let stderr = "";
+    let probeError = null;
+    try {
+      const result = runProbe(entry.flag) ?? {};
+      stderr = String(result.stderr ?? "");
+    } catch (error) {
+      probeError = error instanceof Error ? error.message : String(error);
+    }
+
+    const satisfied = !probeError && !/unknown option/.test(stderr);
+    if (!satisfied) {
+      missing.push({
+        flag: entry.flag,
+        note: entry.note,
+        reason: probeError ? `probe failed: ${probeError}` : `claude rejected the flag: ${stderr.trim().split("\n", 1)[0]}`
+      });
+    }
+    checks.push({ flag: entry.flag, note: entry.note, satisfied, probeError });
+  }
+
+  return { ok: missing.length === 0, checks, missing };
+}
+
+/**
+ * Build a human-readable report from a verifyHiddenFlags() result.
+ */
+export function formatHiddenFlagsReport(verification, label = "claude hidden flags") {
+  const lines = [];
+  const status = verification.ok ? "OK" : "FAILED";
+  lines.push(`${label}: ${status}`);
+  for (const check of verification.checks) {
+    const mark = check.satisfied ? "ok" : "MISSING";
+    lines.push(`  - ${check.flag}: ${mark}`);
+  }
+  if (!verification.ok) {
+    lines.push("");
+    lines.push("Rejected hidden flags:");
+    for (const item of verification.missing) {
+      lines.push(`  - ${item.flag} -> ${item.reason}`);
+      lines.push(`      used by: ${item.note}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
  * Remove ANSI escape sequences (CSI color codes, etc.) from a string.
  * Commander may emit these even when NO_COLOR is requested (e.g. when run
  * under a force-color shim), and when glued to a flag (e.g.

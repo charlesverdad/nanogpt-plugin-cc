@@ -11,7 +11,8 @@ import { readStdinIfPiped } from "./lib/fs.mjs";
 import {
   pingNanoGpt,
   fetchSubscriptionUsage,
-  describeSubscription
+  describeSubscription,
+  buildRunQuota
 } from "./lib/account.mjs";
 import {
   loadModelCatalog,
@@ -42,11 +43,15 @@ import {
   buildRunLogEntry,
   compareVersions,
   DEFAULT_BASH_ALLOW,
+  DEFAULT_REVIEW_MAX_TURNS,
+  DEFAULT_TASK_MAX_TURNS,
   getClaudeAvailability,
+  isMaxTurnsStop,
   isToolUseProgressLine,
   KEY_SETUP_COMMAND,
   MIN_CLAUDE_VERSION,
   normalizeBashAllow,
+  normalizeMaxTurns,
   parseClaudeJsonOutput,
   parseStreamEvent,
   parseClaudeVersion,
@@ -87,7 +92,8 @@ import {
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult,
-  renderTaskRun
+  renderTaskRun,
+  maxTurnsStopMessage
 } from "./lib/render.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -133,9 +139,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/nano-companion.mjs setup [--json]",
-      "  node scripts/nano-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>]",
-      "  node scripts/nano-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [focus text]",
-      "  node scripts/nano-companion.mjs task [--background] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [prompt]",
+      "  node scripts/nano-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--max-turns <n>]",
+      "  node scripts/nano-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--max-turns <n>] [focus text]",
+      "  node scripts/nano-companion.mjs task [--background] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [prompt]",
       "  node scripts/nano-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/nano-companion.mjs result [job-id] [--json]",
       "  node scripts/nano-companion.mjs cancel [job-id] [--json]"
@@ -435,9 +441,6 @@ async function buildSetupReport(cwd, actionsTaken = []) {
       `Allow the project test command: ${testSuggestion.command} (risk: NanoGPT can then run any code it writes into the tests or build files)`
     );
   }
-  if (apiKey && claudeAvailability.available && !reviewGateEnabled) {
-    nextSteps.push("Optional: run `/nano:setup --enable-review-gate` to require a fresh review before stop.");
-  }
 
   return {
     ready,
@@ -539,7 +542,7 @@ async function handleSetup(argv) {
 
 /**
  * request = { cwd, prompt, model, profile ("read"|"write"), bashAllow,
- *   resumeSessionId, streaming, onProgress, onSession }
+ *   resumeSessionId, streaming, onProgress, onSession, maxTurns }
  *
  * The permission profile is always rebuilt here from its name and the Bash
  * allowlist (validated by normalizeBashAllow); a ready-made tools/allowedTools
@@ -547,9 +550,13 @@ async function handleSetup(argv) {
  *
  * The API key is resolved fresh here (never taken from `request`), so a
  * queued background job's stored request never contains it. Returns
- * `{ exitStatus, summary (null if no JSON), permissions, model, stderr,
- * stdout }`. `exitStatus` is 0 only if the process exited 0 AND the stdout
- * parsed as JSON AND `summary.isError` is false.
+ * `{ exitStatus, summary (null if no JSON), permissions, model, quota,
+ * stderr, stdout }`. `exitStatus` is 0 only if the process exited 0 AND the
+ * stdout parsed as JSON AND `summary.isError` is false.
+ *
+ * `quota` is built from subscription usage snapshots taken just before and
+ * just after the run (see buildRunQuota). A failed or slow usage fetch never
+ * fails the run: `quota` is null when the after-snapshot failed.
  *
  * With `streaming` the run uses `--output-format stream-json --verbose` and
  * each stdout line is fed to parseStreamEvent: progress strings are passed to
@@ -566,7 +573,8 @@ async function executeClaudeRun({
   resumeSessionId = null,
   streaming = false,
   onProgress = null,
-  onSession = null
+  onSession = null,
+  maxTurns = null
 }) {
   if (typeof profile !== "string") {
     throw new Error('Invalid permission profile: expected "read" or "write".');
@@ -577,7 +585,8 @@ async function executeClaudeRun({
   const permissions = buildPermissionProfile(profile, { bashAllow });
 
   const { key: apiKey } = requireApiKey();
-  const env = buildChildEnv({ apiKey, model, baseUrl: resolveBaseUrl() });
+  const baseUrl = resolveBaseUrl();
+  const env = buildChildEnv({ apiKey, model, baseUrl });
   const promptViaStdin = shouldSendPromptViaStdin(prompt);
   const args = buildClaudeArgs({
     prompt,
@@ -585,7 +594,8 @@ async function executeClaudeRun({
     profile: permissions,
     resumeSessionId,
     outputFormat: streaming ? "stream-json" : "json",
-    promptViaStdin
+    promptViaStdin,
+    maxTurns
   });
 
   if (typeof onProgress === "function") {
@@ -613,6 +623,17 @@ async function executeClaudeRun({
       }
     : null;
 
+  // Quota snapshots around the run. fetchSubscriptionUsage never throws, but
+  // guard anyway: a quota read must never fail the run.
+  const fetchUsage = async () => {
+    try {
+      return await fetchSubscriptionUsage({ apiKey, baseUrl, timeoutMs: 5000 });
+    } catch {
+      return null;
+    }
+  };
+  const usageBefore = await fetchUsage();
+
   const result = await runClaude({
     cwd,
     args,
@@ -620,6 +641,9 @@ async function executeClaudeRun({
     input: promptViaStdin ? prompt : null,
     onStdoutLine
   });
+
+  const usageAfter = await fetchUsage();
+  const quota = buildRunQuota(usageBefore, usageAfter);
 
   const parsed = parseClaudeJsonOutput(result.stdout);
   const summary = parsed ? summarizeClaudeResult(parsed) : null;
@@ -631,6 +655,7 @@ async function executeClaudeRun({
       cwd,
       allowedTools: permissions.allowedTools,
       task: prompt,
+      quotaDelta: quota?.delta ?? null,
       summary: summary ?? {
         isError: true,
         numTurns: null,
@@ -648,6 +673,7 @@ async function executeClaudeRun({
     streamSessionId,
     permissions,
     model,
+    quota,
     stderr: result.stderr,
     stdout: result.stdout
   };
@@ -695,9 +721,12 @@ async function executeReviewRun(request) {
     prompt,
     model: request.model,
     profile: "read",
+    maxTurns: request.maxTurns ?? null,
     onProgress: request.onProgress
   });
 
+  const maxTurns = request.maxTurns ?? null;
+  const stoppedAtMaxTurns = isMaxTurnsStop(run.summary);
   const warnings = Array.isArray(request.warnings) ? request.warnings : [];
   const rendered = renderReviewResult({
     reviewLabel: reviewName,
@@ -706,7 +735,9 @@ async function executeReviewRun(request) {
     model: run.model,
     stdout: run.stdout,
     stderr: run.stderr,
-    warnings
+    warnings,
+    quota: run.quota,
+    maxTurns
   });
 
   const payload = {
@@ -721,18 +752,23 @@ async function executeReviewRun(request) {
     permissionDenials: run.summary?.permissionDenials ?? [],
     numTurns: run.summary?.numTurns ?? null,
     durationMs: run.summary?.durationMs ?? null,
+    quota: run.quota ?? null,
+    stopReason: stoppedAtMaxTurns ? "max_turns" : null,
+    maxTurns,
     stderr: run.stderr,
     warnings,
-    footer: renderRunFooter({ model: run.model, summary: run.summary })
+    footer: renderRunFooter({ model: run.model, summary: run.summary, quota: run.quota })
   };
 
   return {
     exitStatus: run.exitStatus,
     payload,
     rendered,
-    summary: run.summary
-      ? firstMeaningfulLine(run.summary.text, `${reviewName} completed.`)
-      : firstMeaningfulLine(run.stderr || run.stdout, `${reviewName} did not return a result.`),
+    summary: stoppedAtMaxTurns
+      ? maxTurnsStopMessage(maxTurns, { canContinue: false })
+      : run.summary
+        ? firstMeaningfulLine(run.summary.text, `${reviewName} completed.`)
+        : firstMeaningfulLine(run.stderr || run.stdout, `${reviewName} did not return a result.`),
     jobTitle: `NanoGPT ${reviewName}`,
     jobClass: "review",
     targetLabel: target.label
@@ -747,6 +783,7 @@ async function executeTaskRun(request) {
   ensureClaudeAvailable(request.cwd);
 
   const prompt = request.prompt || "Continue from where you left off.";
+  const maxTurns = request.maxTurns ?? null;
 
   const run = await executeClaudeRun({
     cwd: request.cwd,
@@ -756,10 +793,12 @@ async function executeTaskRun(request) {
     bashAllow: request.bashAllow,
     resumeSessionId: request.resumeSessionId ?? null,
     streaming: request.streaming ?? false,
+    maxTurns,
     onProgress: request.onProgress,
     onSession: request.onSession
   });
 
+  const stoppedAtMaxTurns = isMaxTurnsStop(run.summary);
   const warnings = Array.isArray(request.warnings) ? request.warnings : [];
   const { rendered, footer } = renderTaskRun({
     summary: run.summary,
@@ -768,7 +807,9 @@ async function executeTaskRun(request) {
     maxChars: resolveMaxInlineChars(),
     stdout: run.stdout,
     stderr: run.stderr,
-    warnings
+    warnings,
+    quota: run.quota,
+    maxTurns
   });
 
   const payload = {
@@ -785,14 +826,19 @@ async function executeTaskRun(request) {
     permissionDenials: run.summary?.permissionDenials ?? [],
     numTurns: run.summary?.numTurns ?? null,
     durationMs: run.summary?.durationMs ?? null,
+    quota: run.quota ?? null,
+    stopReason: stoppedAtMaxTurns ? "max_turns" : null,
+    maxTurns,
     stderr: run.stderr,
     warnings,
     footer
   };
 
-  const summary = run.summary
-    ? firstMeaningfulLine(run.summary.text, run.summary.isError ? "NanoGPT run failed." : "Task finished.")
-    : firstMeaningfulLine(run.stderr || run.stdout, "NanoGPT did not return a result.");
+  const summary = stoppedAtMaxTurns
+    ? maxTurnsStopMessage(maxTurns, { canContinue: true })
+    : run.summary
+      ? firstMeaningfulLine(run.summary.text, run.summary.isError ? "NanoGPT run failed." : "Task finished.")
+      : firstMeaningfulLine(run.stderr || run.stdout, "NanoGPT did not return a result.");
 
   return {
     exitStatus: run.exitStatus,
@@ -878,7 +924,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, origin = null) {
   return origin ? { ...job, origin } : job;
 }
 
-function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId, warnings }) {
+function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId, warnings, maxTurns }) {
   return {
     cwd,
     model,
@@ -887,6 +933,7 @@ function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessio
     bashAllow,
     resumeSessionId,
     jobId,
+    maxTurns,
     warnings: Array.isArray(warnings) ? warnings : []
   };
 }
@@ -926,17 +973,30 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Write the job file and index record *before* spawning the worker. The
+  // worker's first act is to read this same job file by id (handleTaskWorker
+  // -> readStoredJob); spawning first raced the worker's read against this
+  // write and could start it before the job existed on disk at all ("No
+  // stored job found"). No pid yet: the worker isn't running until spawn
+  // below returns. Only after that succeeds do we patch the index with its
+  // pid - a minimal `{ id, pid }` upsert (not the full record) so it can
+  // never revert a status the worker has already reported through the lock
+  // that upsertJob/updateState now hold.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  if (child.pid != null) {
+    upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid });
+  }
 
   return {
     payload: {
@@ -952,12 +1012,15 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "max-turns"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
     }
   });
+
+  // Throws (exit 1) on an invalid value.
+  const maxTurns = normalizeMaxTurns(options["max-turns"]) ?? DEFAULT_REVIEW_MAX_TURNS;
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -992,6 +1055,7 @@ async function handleReviewCommand(argv, config) {
         focusText,
         reviewName: config.reviewName,
         warnings,
+        maxTurns,
         onProgress: progress
       }),
     { json: options.json }
@@ -1042,7 +1106,7 @@ function resolveTaskResumeCandidate(workspaceRoot) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "cwd"],
+    valueOptions: ["model", "cwd", "max-turns"],
     multiValueOptions: ["allow-bash"],
     booleanOptions: ["json", "continue", "background", "thinking", "wait", "read-only", "allow-paid", "fresh"],
     aliasMap: {
@@ -1053,6 +1117,11 @@ async function handleTask(argv) {
   if (options["read-only"] && options["allow-bash"]) {
     throw new Error("`--read-only` cannot be combined with `--allow-bash`.");
   }
+
+  // Throws (exit 1) on an invalid value. --continue deliberately does NOT
+  // carry the previous run's maxTurns over: this run's flag or the default
+  // applies.
+  const maxTurns = normalizeMaxTurns(options["max-turns"]) ?? DEFAULT_TASK_MAX_TURNS;
 
   const explicitCwd = Boolean(options.cwd);
   const invocationCwd = resolveCommandCwd(options);
@@ -1112,7 +1181,7 @@ async function handleTask(argv) {
   if (options.background) {
     ensureClaudeAvailable(cwd);
     const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write", origin);
-    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id, warnings });
+    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id, warnings, maxTurns });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
@@ -1131,6 +1200,7 @@ async function handleTask(argv) {
         resumeSessionId,
         jobId: job.id,
         warnings,
+        maxTurns,
         onProgress: progress
       }),
     { json: options.json }

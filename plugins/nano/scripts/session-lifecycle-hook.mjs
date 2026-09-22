@@ -4,7 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { resolveStateFile, updateState } from "./lib/state.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -40,11 +40,16 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
+  // Read-modify-write state.json (dropping this session's jobs) through
+  // updateState rather than loadState+saveState, so this hook - which runs
+  // as its own process and can race a background worker or another
+  // companion invocation writing the same state.json - takes the same
+  // cross-process lock they do instead of silently losing their update.
+  let removedJobs = [];
+  updateState(workspaceRoot, (state) => {
+    removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+  });
 
   for (const job of removedJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
@@ -57,11 +62,6 @@ function cleanupSessionJobs(cwd, sessionId) {
       // Ignore teardown failures during session shutdown.
     }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
 }
 
 function handleSessionStart(input) {

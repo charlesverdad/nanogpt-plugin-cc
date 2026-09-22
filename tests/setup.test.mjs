@@ -34,7 +34,8 @@ function startFakeServer(options = {}) {
   const env = {
     ...process.env,
     FAKE_NANOGPT_EXPECTED_KEY: FAKE_API_KEY,
-    FAKE_NANOGPT_MODE: options.mode ?? "active"
+    FAKE_NANOGPT_MODE: options.mode ?? "active",
+    ...(options.usageStep ? { FAKE_NANOGPT_USAGE_STEP: String(options.usageStep) } : {})
   };
   const child = spawn(process.execPath, [SERVER], {
     env,
@@ -486,4 +487,57 @@ test("setup --json output never contains FAKE_API_KEY", async () => {
   } finally {
     server.child.kill();
   }
+});
+
+// ---------------------------------------------------------------------------
+// quota footer/payload against the fake NanoGPT server
+// ---------------------------------------------------------------------------
+
+test("a task against the fake NanoGPT server with a usage step shows quota=+1.2M week= in the footer and JSON", async () => {
+  const server = await startFakeServer({ usageStep: 1200000 });
+  try {
+    const rt = setupRuntime({ server });
+    const result = runCompanion(rt, ["task", "--json", "Do a thing"]);
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(result.stdout);
+
+    assert.ok(payload.quota, "quota should be present when the fake server is reachable");
+    assert.equal(payload.quota.delta, 1200000);
+    assert.match(payload.footer, /quota=\+1\.2M week=\d+%/);
+
+    const humanResult = runCompanion(rt, ["task", "Another thing"]);
+    assert.equal(humanResult.status, 0, humanResult.stderr);
+    assert.match(humanResult.stdout, /quota=\+1\.2M week=\d+%/);
+  } finally {
+    server.child.kill();
+  }
+});
+
+test("the default offline task run shows no quota part in the footer or JSON", () => {
+  // No fake server: NANOGPT_BASE_URL stays at the unreachable default
+  // (http://127.0.0.1:9), so the quota snapshot fails fast.
+  const rt = setupRuntime();
+  const result = runCompanion(rt, ["task", "--json", "Do a thing"]);
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.quota, null);
+  assert.equal(payload.footer.includes("quota="), false);
+  assert.equal(payload.footer.includes("week="), false);
+});
+
+// ---------------------------------------------------------------------------
+// review gate stays off by default (task 4)
+// ---------------------------------------------------------------------------
+
+test("on a fresh plugin data dir, setup --json reports reviewGateEnabled false and no nextStep mentions the review gate", () => {
+  const rt = setupRuntime();
+  const result = runCompanion(rt, ["setup", "--json"]);
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.reviewGateEnabled, false);
+  assert.equal(
+    payload.nextSteps.some((step) => /review gate/i.test(step)),
+    false,
+    `no nextStep should mention the review gate: ${JSON.stringify(payload.nextSteps)}`
+  );
 });

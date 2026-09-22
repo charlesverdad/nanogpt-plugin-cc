@@ -1,3 +1,19 @@
+import { formatTokenCount } from "./account.mjs";
+import { isMaxTurnsStop } from "./runtime.mjs";
+
+/**
+ * Message shown when a run stopped at the --max-turns cap before finishing.
+ * Tasks can resume with --continue; reviews cannot, so they get a rerun hint
+ * only.
+ */
+export function maxTurnsStopMessage(maxTurns, { canContinue = true } = {}) {
+  const cap = typeof maxTurns === "number" ? maxTurns : "?";
+  const hint = canContinue
+    ? "Continue where it left off with --continue, or rerun with a higher --max-turns."
+    : "Rerun with a higher --max-turns.";
+  return `Stopped at the turn limit (${cap} turns) before finishing. ${hint}`;
+}
+
 function escapeMarkdownCell(value) {
   return String(value ?? "")
     .replace(/\|/g, "\\|")
@@ -135,7 +151,7 @@ export function renderNoResultBody({ stdout = "", stderr = "" } = {}) {
  * (untruncated) result text, and the run footer. When there is no parseable
  * result, falls back to `renderNoResultBody` with no footer.
  */
-export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "", warnings = [] } = {}) {
+export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null } = {}) {
   const lines = [`# NanoGPT ${reviewLabel}`, "", `Target: ${targetLabel}`, ""];
 
   if (!summary) {
@@ -144,12 +160,16 @@ export function renderReviewResult({ reviewLabel, targetLabel, summary, model, s
     return `${trimmed}\n`;
   }
 
-  const text = String(summary.text ?? "").trim() || "NanoGPT review completed without any output.";
-  lines.push(summary.isError ? `NanoGPT review failed:\n\n${text}` : text);
+  if (isMaxTurnsStop(summary)) {
+    lines.push(maxTurnsStopMessage(maxTurns, { canContinue: false }));
+  } else {
+    const text = String(summary.text ?? "").trim() || "NanoGPT review completed without any output.";
+    lines.push(summary.isError ? `NanoGPT review failed:\n\n${text}` : text);
+  }
   for (const warning of warnings) {
     lines.push(`Warning: ${warning}`);
   }
-  lines.push("", renderRunFooter({ model, summary }));
+  lines.push("", renderRunFooter({ model, summary, quota }));
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
@@ -161,14 +181,19 @@ export function renderReviewResult({ reviewLabel, targetLabel, summary, model, s
  * Falls back to `renderNoResultBody` (no footer) when there is no parseable
  * result at all.
  */
-export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "", warnings = [] } = {}) {
+export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null } = {}) {
   if (!summary) {
     return { rendered: renderNoResultBody({ stdout, stderr }), footer: null };
   }
 
-  const { text } = truncateInline(summary.text, { maxChars, jobId });
-  const footer = renderRunFooter({ model, summary });
-  const body = summary.isError ? `NanoGPT run failed:\n\n${text}` : text;
+  const footer = renderRunFooter({ model, summary, quota });
+  let body;
+  if (isMaxTurnsStop(summary)) {
+    body = maxTurnsStopMessage(maxTurns, { canContinue: true });
+  } else {
+    const { text } = truncateInline(summary.text, { maxChars, jobId });
+    body = summary.isError ? `NanoGPT run failed:\n\n${text}` : text;
+  }
   const lines = [body];
   for (const warning of warnings) {
     lines.push(`Warning: ${warning}`);
@@ -320,8 +345,11 @@ export function formatDenials(denials = []) {
 
 /**
  * One-line run footer mirroring bin/nano-agent's `[nano-agent] ...` footer.
+ * With a `quota` object (buildRunQuota), appends `quota=+<delta>` (omitted when
+ * the delta is unknown or negative — a negative delta means the weekly window
+ * reset mid-run) and `week=<percent>%` (omitted when not computable).
  */
-export function renderRunFooter({ model, summary }) {
+export function renderRunFooter({ model, summary, quota = null }) {
   const usage = summary.usage ?? {};
   const inputTokens = usage.input_tokens ?? 0;
   const cacheRead = usage.cache_read_input_tokens ?? 0;
@@ -330,6 +358,12 @@ export function renderRunFooter({ model, summary }) {
   const secs = Math.floor((summary.durationMs ?? 0) / 1000);
   const session = summary.sessionId ?? "none";
   let footer = `[nano] model=${model} turns=${numTurns} tokens=${inputTokens + cacheRead}in/${outputTokens}out secs=${secs} session=${session}`;
+  if (quota && typeof quota.delta === "number" && quota.delta >= 0) {
+    footer += ` quota=+${formatTokenCount(quota.delta)}`;
+  }
+  if (quota && typeof quota.weekPercent === "number") {
+    footer += ` week=${quota.weekPercent}%`;
+  }
   if (Array.isArray(summary.permissionDenials) && summary.permissionDenials.length > 0) {
     footer += ` denied=${formatDenials(summary.permissionDenials)}`;
   }

@@ -11,11 +11,19 @@
 // Env:
 //   FAKE_NANOGPT_EXPECTED_KEY  the api key the server expects in x-api-key
 //   FAKE_NANOGPT_MODE          "inactive" makes /subscription return active:false
+//   FAKE_NANOGPT_USAGE_STEP    `used` grows by this many tokens on every usage
+//                              GET after the first (default 0), so tests can
+//                              observe a quota delta across a run.
 
 import { createServer } from "node:http";
 
 const EXPECTED_KEY = process.env.FAKE_NANOGPT_EXPECTED_KEY ?? "nano-test-key-DO-NOT-LEAK-7f3a";
 const MODE = process.env.FAKE_NANOGPT_MODE ?? "active";
+const USAGE_STEP = Number(process.env.FAKE_NANOGPT_USAGE_STEP ?? "0") || 0;
+
+const USAGE_BASE_USED = 1000;
+const WEEKLY_LIMIT = 60000000;
+let usageGetCount = 0;
 
 const CATALOG = {
   object: "list",
@@ -107,20 +115,22 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && path === "/subscription/v1/usage") {
+    usageGetCount += 1;
+    const used = USAGE_BASE_USED + USAGE_STEP * Math.max(0, usageGetCount - 1);
     if (MODE === "inactive") {
       sendJson(res, 200, {
         active: false,
         allowOverage: false,
-        limits: { weeklyInputTokens: 60000000 },
-        weeklyInputTokens: { used: 60000000, remaining: 0, resetAt: 1790553600000 }
+        limits: { weeklyInputTokens: WEEKLY_LIMIT },
+        weeklyInputTokens: { used: WEEKLY_LIMIT, remaining: 0, resetAt: 1790553600000 }
       });
       return;
     }
     sendJson(res, 200, {
       active: true,
       allowOverage: false,
-      limits: { weeklyInputTokens: 60000000 },
-      weeklyInputTokens: { used: 1000, remaining: 59999000, resetAt: 1790553600000 }
+      limits: { weeklyInputTokens: WEEKLY_LIMIT },
+      weeklyInputTokens: { used, remaining: WEEKLY_LIMIT - used, resetAt: 1790553600000 }
     });
     return;
   }

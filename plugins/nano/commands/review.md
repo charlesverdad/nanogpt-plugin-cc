@@ -1,6 +1,6 @@
 ---
 description: Run a NanoGPT code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-turns <n>]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -37,6 +37,7 @@ Argument handling:
 - Do not add extra review instructions or rewrite the user's intent.
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
 - `/nano:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
+- `--max-turns <n>` caps the review at n turns (default 15). Reviews are read-only and rarely need more; every turn counts against the NanoGPT weekly quota, cached input included.
 - If the user needs custom review instructions or more adversarial framing, they should use `/nano:adversarial-review`.
 
 Foreground flow:

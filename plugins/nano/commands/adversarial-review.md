@@ -1,6 +1,6 @@
 ---
 description: Run a NanoGPT review that challenges the implementation approach and design choices
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-turns <n>] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -41,6 +41,7 @@ Argument handling:
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
 - `/nano:adversarial-review` uses the same review target selection as `/nano:review`.
 - It supports working-tree review, branch review, and `--base <ref>`.
+- `--max-turns <n>` caps the review at n turns (default 15). Every turn counts against the NanoGPT weekly quota, cached input included.
 - It does not support `--scope staged` or `--scope unstaged`.
 - Unlike `/nano:review`, it can still take extra focus text after the flags.
 
