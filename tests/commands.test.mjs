@@ -131,17 +131,27 @@ test("rescue command forwards to the nano-rescue subagent verbatim", () => {
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or NanoGPT cannot be invoked, return nothing/i);
 
-  assert.match(readme, /`kimi:kimi-rescue` subagent/i);
-  assert.match(readme, /if you do not pass `--model`, Kimi chooses its own defaults/i);
-  assert.match(readme, /### `\/kimi:setup`/);
-  assert.match(readme, /### `\/kimi:review`/);
-  assert.match(readme, /### `\/kimi:adversarial-review`/);
-  assert.match(readme, /uses the same review target selection as `\/kimi:review`/i);
-  assert.match(readme, /--base main challenge whether this was the right caching and retry design/);
-  assert.match(readme, /### `\/kimi:rescue`/);
-  assert.match(readme, /### `\/kimi:status`/);
-  assert.match(readme, /### `\/kimi:result`/);
-  assert.match(readme, /### `\/kimi:cancel`/);
+  assert.match(readme, /\/plugin install nano@nanogpt-plugin-cc/);
+  assert.match(readme, /security add-generic-password -a "\$USER" -s nanogpt-api-key -w/);
+  assert.match(readme, /Never put it in a `\.env` file/i);
+  assert.match(readme, /\/nano:rescue/);
+  assert.match(readme, /\/nano:review/);
+  assert.match(readme, /\/nano:adversarial-review/);
+  assert.match(readme, /### \/nano:setup/);
+  assert.match(readme, /### \/nano:review/);
+  assert.match(readme, /### \/nano:adversarial-review/);
+  assert.match(readme, /### \/nano:rescue/);
+  assert.match(readme, /### \/nano:status/);
+  assert.match(readme, /### \/nano:result/);
+  assert.match(readme, /### \/nano:cancel/);
+  assert.match(readme, /uses the same target selection as `\/nano:review`/i);
+  assert.match(readme, /the NanoGPT model can read files but cannot edit them or run commands/i);
+  assert.match(readme, /\| `read` \|/);
+  assert.match(readme, /\| `write` \|/);
+  assert.match(readme, /\| `default` \| `z-ai\/glm-5\.2` \|/);
+  assert.match(readme, /\| `heavy` \| `z-ai\/glm-5\.3` \|/);
+  assert.match(readme, /\| `alt` \| `minimax\/minimax-m3` \|/);
+  assert.match(readme, /\| `fast` \| `z-ai\/glm-5\.3-flash` \|/);
 });
 
 test("result and cancel commands are deterministic runtime entrypoints", () => {
@@ -176,7 +186,7 @@ test("setup command points users to the keychain command for the API key", () =>
   assert.match(setup, /--disallow-bash/);
 });
 
-test("review and adversarial-review prompts use kimi review framing", () => {
+test("review and adversarial-review prompts use nano review framing", () => {
   const reviewPrompt = read("prompts/review.md");
   const adversarialPrompt = read("prompts/adversarial-review.md");
 
@@ -189,4 +199,29 @@ test("review and adversarial-review prompts use kimi review framing", () => {
   assert.match(adversarialPrompt, /\{\{TARGET_LABEL\}\}/);
   assert.match(adversarialPrompt, /\{\{USER_FOCUS\}\}/);
   assert.match(adversarialPrompt, /\{\{REVIEW_INPUT\}\}/);
+});
+
+test("nano-rescue agent uses model: haiku and documents the direct companion task call", () => {
+  const agent = read("agents/nano-rescue.md");
+  const runtimeSkill = read("skills/nano-runtime/SKILL.md");
+
+  assert.match(agent, /^model:\s*haiku$/m);
+  assert.match(agent, /--read-only/);
+  assert.match(agent, /--allow-bash/);
+  assert.match(agent, /--allow-paid/);
+  assert.match(agent, /--model` \(id or alias: `default`, `heavy`, `alt`, `fast`\)/);
+  assert.match(agent, /--thinking/);
+  assert.match(agent, /--continue` \/ `--fresh/);
+
+  assert.match(runtimeSkill, /node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/nano-companion\.mjs" task \.\.\./);
+  assert.match(runtimeSkill, /skipping the `nano:nano-rescue` forwarder/i);
+  assert.match(runtimeSkill, /--background/);
+  assert.match(runtimeSkill, /--continue/);
+  assert.match(runtimeSkill, /--model/);
+  assert.match(runtimeSkill, /--thinking/);
+  assert.match(runtimeSkill, /--read-only/);
+  assert.match(runtimeSkill, /--allow-bash/);
+  assert.match(runtimeSkill, /--allow-paid/);
+  assert.match(runtimeSkill, /--json/);
+  assert.match(runtimeSkill, /denied=\.\.\./);
 });
