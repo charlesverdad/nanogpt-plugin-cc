@@ -1,6 +1,6 @@
 ---
-description: Check whether the local NanoGPT CLI is ready and optionally toggle the stop-time review gate
-argument-hint: '[--enable-review-gate|--disable-review-gate]'
+description: Check whether the local NanoGPT setup is ready and optionally toggle the stop-time review gate or configure the model / Bash allowlist
+argument-hint: '[--model <id|alias>] [--allow-bash <prefix>] [--disallow-bash <prefix>] [--enable-review-gate|--disable-review-gate]'
 allowed-tools: Bash(node:*), AskUserQuestion
 ---
 
@@ -10,15 +10,18 @@ Run:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/nano-companion.mjs" setup --json $ARGUMENTS
 ```
 
-If the result says NanoGPT is unavailable:
-- Tell the user to install NanoGPT CLI from https://moonshotai.github.io/kimi-cli/
+Present the checklist from the command's output to the user verbatim.
 
-If NanoGPT is installed but not authenticated:
-- Tell the user to run `!kimi login`.
+If the API key check fails (no NanoGPT API key found):
+- Tell the user to run this command themselves (it prompts for the key so the key never lands in shell history or chat):
+  `security add-generic-password -a "$USER" -s nanogpt-api-key -w`
+- Never ask the user to paste the API key into the chat, and never suggest storing it in a `.env` file or any plaintext config.
 
-The stop-time review gate is optional and off by default. Pass
-`--enable-review-gate` to require a fresh NanoGPT review before a session can stop,
-or `--disable-review-gate` to turn it back off.
+If Claude Code is missing or too old:
+- Tell the user to install or upgrade Claude Code to the required minimum version.
 
-Presenting the result:
-- Present the final setup output to the user.
+The `--model` option accepts a model id or alias (`default`, `heavy`, `alt`, `fast`) and stores the resolved model as the workspace default.
+
+`--allow-bash <prefix>` (repeatable) adds a Bash command prefix to the workspace allowlist; `--disallow-bash <prefix>` (repeatable) removes one. Built-in defaults cannot be removed.
+
+The stop-time review gate is optional and off by default. Pass `--enable-review-gate` to require a fresh NanoGPT review before a session can stop, or `--disable-review-gate` to turn it back off.

@@ -67,19 +67,36 @@ function appendActiveJobsTable(lines, jobs) {
 }
 
 export function renderSetupReport(report) {
-  const claudeDetail = report.claude.version ? `${report.claude.detail} (version ${report.claude.version})` : report.claude.detail;
-  const apiKeyDetail = report.apiKey.present ? `present (${report.apiKey.source})` : "missing";
   const lines = [
     "# NanoGPT Setup",
     "",
     `Status: ${report.ready ? "ready" : "needs attention"}`,
     "",
-    "Checks:",
-    `- claude: ${claudeDetail}`,
-    `- api key: ${apiKeyDetail}`,
-    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
-    ""
+    "Checks:"
   ];
+
+  for (const check of report.checks ?? []) {
+    const mark = check.ok ? "ok" : "!!";
+    lines.push(`- [${mark}] ${check.label}: ${check.detail}`);
+  }
+
+  lines.push("", `Default model: ${report.defaultModel}`, "");
+
+  lines.push("Aliases:");
+  for (const alias of report.aliases ?? []) {
+    lines.push(`- ${alias}`);
+  }
+  lines.push("");
+
+  lines.push("Bash allowlist:");
+  for (const prefix of report.bashAllow ?? []) {
+    lines.push(`- ${prefix}`);
+  }
+  lines.push("");
+
+  lines.push(`Review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`);
+  lines.push(`Catalog source: ${report.catalogSource ?? "unknown"}`);
+  lines.push("");
 
   if (report.actionsTaken.length > 0) {
     lines.push("Actions taken:");
@@ -118,16 +135,20 @@ export function renderNoResultBody({ stdout = "", stderr = "" } = {}) {
  * (untruncated) result text, and the run footer. When there is no parseable
  * result, falls back to `renderNoResultBody` with no footer.
  */
-export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "" } = {}) {
+export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "", warnings = [] } = {}) {
   const lines = [`# NanoGPT ${reviewLabel}`, "", `Target: ${targetLabel}`, ""];
 
   if (!summary) {
     lines.push(renderNoResultBody({ stdout, stderr }).trimEnd());
-    return `${lines.join("\n").trimEnd()}\n`;
+    const trimmed = lines.join("\n").trimEnd();
+    return `${trimmed}\n`;
   }
 
   const text = String(summary.text ?? "").trim() || "NanoGPT review completed without any output.";
   lines.push(summary.isError ? `NanoGPT review failed:\n\n${text}` : text);
+  for (const warning of warnings) {
+    lines.push(`Warning: ${warning}`);
+  }
   lines.push("", renderRunFooter({ model, summary }));
   return `${lines.join("\n").trimEnd()}\n`;
 }
@@ -140,7 +161,7 @@ export function renderReviewResult({ reviewLabel, targetLabel, summary, model, s
  * Falls back to `renderNoResultBody` (no footer) when there is no parseable
  * result at all.
  */
-export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "" } = {}) {
+export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "", warnings = [] } = {}) {
   if (!summary) {
     return { rendered: renderNoResultBody({ stdout, stderr }), footer: null };
   }
@@ -148,7 +169,12 @@ export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout =
   const { text } = truncateInline(summary.text, { maxChars, jobId });
   const footer = renderRunFooter({ model, summary });
   const body = summary.isError ? `NanoGPT run failed:\n\n${text}` : text;
-  return { rendered: `${body}\n\n${footer}\n`, footer };
+  const lines = [body];
+  for (const warning of warnings) {
+    lines.push(`Warning: ${warning}`);
+  }
+  lines.push("", footer);
+  return { rendered: `${lines.join("\n")}\n`, footer };
 }
 
 export function renderStatusReport(report) {

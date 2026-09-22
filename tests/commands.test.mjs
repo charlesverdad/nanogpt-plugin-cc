@@ -162,17 +162,18 @@ test("internal runtime skill uses task terminology for rescue runs", () => {
   assert.match(runtimeSkill, /user-invocable: false/);
 });
 
-test("setup command points users to kimi install and login", () => {
+test("setup command points users to the keychain command for the API key", () => {
   const setup = read("commands/setup.md");
-  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
-  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
+  assert.match(setup, /argument-hint:\s*'\[--model <id\|alias>\] \[--allow-bash <prefix>\] \[--disallow-bash <prefix>\] \[--enable-review-gate\|--disable-review-gate\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /nano-companion\.mjs" setup --json \$ARGUMENTS/);
-  assert.match(setup, /https:\/\/moonshotai\.github\.io\/kimi-cli\//);
-  assert.match(setup, /!kimi login/);
-  assert.match(readme, /!kimi login/);
-  assert.match(readme, /\/kimi:setup/);
+  assert.match(setup, /security add-generic-password -a "\$USER" -s nanogpt-api-key -w/);
+  assert.match(setup, /never suggest storing it in a `\.env` file/i);
+  assert.match(setup, /install or upgrade Claude Code/i);
+  assert.match(setup, /--model/);
+  assert.match(setup, /--allow-bash/);
+  assert.match(setup, /--disallow-bash/);
 });
 
 test("review and adversarial-review prompts use kimi review framing", () => {
