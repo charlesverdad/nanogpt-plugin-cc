@@ -11,7 +11,7 @@ Raw slash-command arguments:
 `$ARGUMENTS`
 
 Core constraint:
-- This command is review-only.
+- This command is review-only. The NanoGPT model can read files but cannot edit them or run commands.
 - Do not fix issues, apply patches, or suggest that you are about to make changes.
 - Your only job is to run the review and return NanoGPT's output verbatim to the user.
 

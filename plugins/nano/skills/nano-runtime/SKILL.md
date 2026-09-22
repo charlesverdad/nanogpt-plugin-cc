@@ -29,6 +29,12 @@ Command selection:
 - If the forwarded request includes `--continue`, strip that token from the task text and add `--continue`.
 - `--continue`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
 
+Calling the companion directly:
+
+- The main Claude thread may also invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/nano-companion.mjs" task ...` directly via `Bash`, skipping the `nano:nano-rescue` forwarder entirely, when it wants the cheapest path. This avoids the subagent hop.
+- The `task` flags are: `--background`, `--continue`, `--model <id|alias>`, `--thinking`, `--read-only`, `--allow-bash <prefix>` (repeatable), `--allow-paid`, and `--json`.
+- The run footer (`[nano] ...`) is printed on stdout. If the footer shows `denied=...`, a tool call was denied by the restricted child; rerun with `--allow-bash "<prefix>"` to grant the missing command rather than working around it.
+
 Safety rules:
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.

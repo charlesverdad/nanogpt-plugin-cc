@@ -11,3 +11,9 @@
 - A prompt starting with `-` is parsed as an option by `claude`; put the prompt after `--`.
 - `gh` in this repo resolves to the `upstream` remote by default; pass `-R charlesverdad/nanogpt-plugin-cc`.
 - Auto mode blocks `gh pr merge` without review ("Merge Without Review"); stack PRs and let the user merge.
+- `bin/nano-agent -b` prefix rules never match pipelines, `&&` chains or `;` sequences. Allowlist single commands and tell the child to run them one at a time. The child also can't delete files unless you allow e.g. `-b 'rm docs/x'`.
+- For bin/nano-agent work, `z-ai/glm-5.2` was the best value: correct on every task in this repo. `z-ai/glm-5.3` was correct too but took 41 min and 2.4M in-tokens (at 2× quota) on a task glm-5.2-sized agents did in 2–13 min.
+- Run parallel nano agents that touch the same files in separate `git worktree`s.
+- Tests that unset NANOGPT_API_KEY must shadow `security`/`secret-tool` on PATH, or the real keychain key is picked up on dev machines.
+- Tests run the companion with spawnSync, which blocks the event loop, so fake HTTP servers must run in a child process.
+- The rtk hook filters `ps` output; use `rtk proxy ps` to see processes.
