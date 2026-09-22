@@ -217,6 +217,7 @@ const apiKeyMatchesFake = process.env.ANTHROPIC_API_KEY === "nano-test-key-DO-NO
 function recordInvocation() {
   const entry = {
     argv: argv,
+    pid: process.pid,
     cwd: process.cwd(),
     prompt: run.prompt,
     model: run.model,
@@ -345,13 +346,14 @@ function finish() {
 }
 
 if (BEHAVIOR === "slow" && run.outputFormat === "stream-json") {
-  // Print the init line BEFORE waiting so background jobs can observe progress.
+  // Record the invocation (including pid) and print the init line BEFORE
+  // waiting, so tests can observe and cancel the still-running process.
+  recordInvocation();
   process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: run.model, cwd: process.cwd() }) + "\\n");
   setTimeout(function () {
     const resultObject = buildResultObject();
     const exitCode = resultObject._exitCode;
     delete resultObject._exitCode;
-    recordInvocation();
     const lines = emitStreamLines(resultObject);
     // Skip the first init line since we already printed it.
     for (let i = 1; i < lines.length; i += 1) {

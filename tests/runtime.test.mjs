@@ -16,7 +16,7 @@ const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "nano-companion.mjs");
 // Import the real state helpers so seeded jobs/config land in the same
 // isolated CLAUDE_PLUGIN_DATA-derived directory the companion uses.
 const STATE_MODULE = pathToFileURL(path.join(PLUGIN_ROOT, "scripts", "lib", "state.mjs")).href;
-const { setConfig, upsertJob, writeJobFile, resolveJobLogFile } = await import(STATE_MODULE);
+const { setConfig, upsertJob, writeJobFile, resolveJobFile, resolveJobLogFile } = await import(STATE_MODULE);
 
 /**
  * Shadow the real `security` (macOS) / `secret-tool` (Linux) binaries with
@@ -97,6 +97,38 @@ function commitInitial(repoDir) {
   fs.writeFileSync(path.join(repoDir, "README.md"), "# fixture\n", "utf8");
   run("git", ["add", "."], { cwd: repoDir });
   run("git", ["commit", "-m", "initial"], { cwd: repoDir });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Polls `fn` every 100ms until it returns a truthy value, failing the test
+ * after `timeoutMs`. Background workers are detached processes, so their
+ * observable side effects (job files, invocation log) arrive asynchronously.
+ */
+async function waitFor(label, fn, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = fn();
+    if (value) {
+      return value;
+    }
+    if (Date.now() >= deadline) {
+      assert.fail(`Timed out after ${timeoutMs}ms waiting for ${label}`);
+    }
+    await sleep(100);
+  }
+}
+
+function isProcessGone(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error.code === "ESRCH";
+  }
 }
 
 // --- setup -----------------------------------------------------------------
@@ -545,6 +577,102 @@ test("task --background runs via a detached worker and produces a completed job"
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.match(payload.storedJob.result.rawOutput, /Fake NanoGPT result\./);
+});
+
+test("a background task streams stream-json progress into the job log and records claudeSessionId", async () => {
+  const rt = setupRuntime("ok");
+  const launch = runCompanion(rt, ["task", "--json", "--background", "Stream progress"]);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const waited = await runCompanion(rt, [
+    "status",
+    jobId,
+    "--wait",
+    "--json",
+    "--timeout-ms",
+    "15000",
+    "--poll-interval-ms",
+    "200"
+  ]);
+  assert.equal(waited.status, 0, waited.stderr);
+  const snapshot = JSON.parse(waited.stdout);
+  assert.equal(snapshot.job.status, "completed");
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].outputFormat, "stream-json");
+  assert.equal(invocations[0].verbose, true);
+  assert.ok(invocations[0].pid);
+
+  const logText = fs.readFileSync(snapshot.job.logFile, "utf8");
+  assert.match(logText, /NanoGPT session \S+ started \(model/);
+  assert.match(logText, /\] Read README\.md/);
+  assert.match(logText, /\] Bash git diff --stat/);
+
+  // The fake uses one session id for both its init line and its result object,
+  // so the stored claudeSessionId can be cross-checked against both.
+  const [, loggedSessionId] = logText.match(/NanoGPT session (\S+) started/);
+  const stored = withPluginData(rt.dataDir, () => JSON.parse(fs.readFileSync(resolveJobFile(rt.repoDir, jobId), "utf8")));
+  assert.equal(typeof stored.claudeSessionId, "string");
+  assert.ok(stored.claudeSessionId.length > 0);
+  assert.equal(stored.claudeSessionId, loggedSessionId);
+  assert.equal(stored.claudeSessionId, stored.result.claudeSessionId);
+});
+
+test("a background task can be cancelled while running and resumed with --continue", async () => {
+  const rt = setupRuntime("slow", { delayMs: 20000 });
+  const launch = runCompanion(rt, ["task", "--json", "--background", "Slow background work"]);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  // The fake prints its init line before sleeping, so the session id lands in
+  // the stored job file while the run is still in progress.
+  const jobFilePath = withPluginData(rt.dataDir, () => resolveJobFile(rt.repoDir, jobId));
+  const storedWhileRunning = await waitFor("the job file to gain a claudeSessionId", () => {
+    if (!fs.existsSync(jobFilePath)) {
+      return null;
+    }
+    const stored = JSON.parse(fs.readFileSync(jobFilePath, "utf8"));
+    return typeof stored.claudeSessionId === "string" && stored.claudeSessionId.length > 0 ? stored : null;
+  });
+  const claudeSessionId = storedWhileRunning.claudeSessionId;
+
+  const status = runCompanion(rt, ["status", jobId, "--json"]);
+  assert.equal(status.status, 0, status.stderr);
+  const statusPayload = JSON.parse(status.stdout);
+  assert.equal(statusPayload.job.status, "running");
+  assert.ok(
+    statusPayload.job.phase === "starting" || statusPayload.job.phase === "running",
+    `unexpected phase ${statusPayload.job.phase}`
+  );
+  assert.ok(statusPayload.job.progressPreview.length > 0, "expected a progress preview");
+
+  const cancel = runCompanion(rt, ["cancel", jobId, "--json"]);
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.equal(JSON.parse(cancel.stdout).status, "cancelled");
+
+  // The worker is a detached process-group leader and claude is its child in
+  // the same group, so the group kill takes out both.
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.ok(invocations[0].pid);
+  await waitFor("the fake claude process to die", () => isProcessGone(invocations[0].pid), 5000);
+
+  const finalStatus = runCompanion(rt, ["status", jobId, "--json"]);
+  assert.equal(finalStatus.status, 0, finalStatus.stderr);
+  assert.equal(JSON.parse(finalStatus.stdout).job.status, "cancelled");
+
+  // The cancelled job keeps its session id so task --continue can resume it.
+  const storedAfterCancel = JSON.parse(fs.readFileSync(jobFilePath, "utf8"));
+  assert.equal(storedAfterCancel.claudeSessionId, claudeSessionId);
+
+  const resume = runCompanion(rt, ["task", "--json", "--continue", "keep going"]);
+  assert.equal(resume.status, 0, resume.stderr);
+  const resumeInvocations = readInvocations(rt.invocationsLog);
+  assert.equal(resumeInvocations.length, 2);
+  assert.equal(resumeInvocations[1].resume, claudeSessionId);
+  assert.match(resumeInvocations[1].prompt, /keep going/);
 });
 
 // --- status / result / cancel -------------------------------------------------
