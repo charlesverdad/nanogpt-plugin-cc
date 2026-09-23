@@ -237,7 +237,18 @@ The workspace default is set with `/nano:setup --model <id|alias>` and stored in
 
 **Quota multipliers:** `z-ai/glm-5.3` and `deepseek/deepseek-v4-pro` count input tokens at 2x against your weekly quota. A one-line warning is printed when the multiplier is greater than 1.
 
-**Cached input counts in full:** the weekly quota counts every input token, and prompt-cache hits aren't discounted. Each turn of a task resends the conversation so far, so a long multi-turn `/nano:rescue` task uses far more quota than a review or a one-shot question. Keep delegated tasks short and well scoped.
+**Cached input counts in full:** the weekly quota counts every input token, and prompt-cache hits aren't discounted. Each turn of a task resends the conversation so far, so a long multi-turn `/nano:rescue` task uses far more quota than a review or a one-shot question.
+
+Measured over the 20 delegated runs that built this plugin, 83.6% of all input tokens were prompt-cache reads (9.52M cached against 1.87M fresh). Against an endpoint that bills cache reads at 0.1x, the same work costs this much more quota here:
+
+| Run | Fresh input | Cache reads | Quota penalty |
+| --- | --- | --- | --- |
+| 8-turn review | 81k | 2.9k | 1.0x |
+| 10-turn task | 83k | 84k | 1.8x |
+| 37-turn task | 71k | 681k | 5.4x |
+| 72-turn task | 97k | 3.84M | 8.2x |
+
+So a one-shot call costs what it would anywhere, while a long agentic run costs up to about 8x more. That 72-turn task used 3.93M tokens, 6.6% of a 60M weekly quota, in one delegation; a review costs about 84k, or 0.14%. Keep delegated tasks short and well scoped: give exact file paths and the verify command so turns aren't spent exploring, lower `--max-turns` for scoped work, and remember that a 2x model multiplier stacks on top of this.
 
 **Thinking mode:** `--thinking` selects the `<model>:thinking` variant when it exists in the catalog. If no thinking variant exists, a warning is printed and the base model runs.
 
