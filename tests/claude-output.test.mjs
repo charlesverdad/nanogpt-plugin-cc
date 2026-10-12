@@ -22,6 +22,12 @@ import {
   summarizeClaudeResult,
   resolveRunLogFile,
   buildRunLogEntry,
+  buildRunErrorText,
+  buildPingLogEntry,
+  createCallTracker,
+  readTranscriptUsage,
+  resolveSessionTranscript,
+  percentile,
   appendRunLog,
   runClaude,
   buildClaudeArgs,
@@ -370,7 +376,24 @@ test("buildRunLogEntry mirrors bin/nano-agent field names and order", () => {
     "denials",
     "session",
     "quotaDelta",
-    "task"
+    "task",
+    "kind",
+    "jobId",
+    "exit",
+    "subtype",
+    "terminalReason",
+    "stopReason",
+    "error",
+    "cache_creation",
+    "promptBytes",
+    "spilledDiffBytes",
+    "wallMs",
+    "maxTurns",
+    "salvaged",
+    "salvage",
+    "calls",
+    "callMsMax",
+    "callMsP50"
   ]);
   assert.deepEqual(entry, {
     ts: "2026-01-02T03:04:05.678Z",
@@ -386,7 +409,24 @@ test("buildRunLogEntry mirrors bin/nano-agent field names and order", () => {
     denials: 1,
     session: "sid-1",
     quotaDelta: null,
-    task: "do something"
+    task: "do something",
+    kind: null,
+    jobId: null,
+    exit: null,
+    subtype: null,
+    terminalReason: null,
+    stopReason: null,
+    error: null,
+    cache_creation: 0,
+    promptBytes: null,
+    spilledDiffBytes: null,
+    wallMs: null,
+    maxTurns: null,
+    salvaged: null,
+    salvage: null,
+    calls: [],
+    callMsMax: null,
+    callMsP50: null
   });
 });
 
@@ -647,14 +687,14 @@ test("runClaude json run: status 0, parseable stdout, noise filtered from stderr
   assert.equal(readInvocations(invocationsLog).length, 1);
 });
 
-test("runClaude stream-json run: onStdoutLine called 5 times, last line is a result", async () => {
+test("runClaude stream-json run: onStdoutLine called 6 times, last line is a result", async () => {
   const { cwd, env } = await setupFakeClaude("ok");
   const args = buildClaudeArgs({ prompt: "go", model: "z-ai/glm-5.2", outputFormat: "stream-json" });
   assert.ok(args.includes("--verbose"), "stream-json args must include --verbose");
   const lines = [];
   const result = await runClaude({ cwd, args, env, onStdoutLine: (line) => lines.push(line) });
   assert.equal(result.status, 0);
-  assert.equal(lines.length, 5, `lines=${JSON.stringify(lines)}`);
+  assert.equal(lines.length, 6, `lines=${JSON.stringify(lines)}`);
   const lastEvent = parseStreamEvent(lines[lines.length - 1], { cwd });
   assert.equal(lastEvent.event.type, "result");
   assert.equal(lastEvent.result.type, "result");
@@ -725,4 +765,218 @@ test("runClaude rejects when claude cannot be found", async () => {
     runClaude({ cwd, args, env }),
     /Could not start claude:/
   );
+});
+
+// --- no-tools salvage args, call tracker, error text ---------------------------
+
+test("buildClaudeArgs noTools emits an empty --tools= and no --allowedTools", () => {
+  const args = buildClaudeArgs({
+    prompt: "wrap up",
+    model: "z-ai/glm-5.2",
+    noTools: true,
+    resumeSessionId: "sid-9",
+    maxTurns: 1,
+    addDirs: ["/tmp/spill"]
+  });
+  assert.ok(args.includes("--tools="));
+  assert.equal(args.some((arg) => arg.startsWith("--allowedTools")), false);
+  assert.deepEqual(args.slice(args.indexOf("--max-turns"), args.indexOf("--max-turns") + 2), ["--max-turns", "1"]);
+  assert.ok(args.includes("--restricted") && args.includes("--strict-mcp-config"));
+  assert.deepEqual(args.slice(args.indexOf("--permission-mode"), args.indexOf("--permission-mode") + 2), ["--permission-mode", "dontAsk"]);
+  assert.deepEqual(args.slice(args.indexOf("--resume"), args.indexOf("--resume") + 2), ["--resume", "sid-9"]);
+  assert.ok(args.includes("--add-dir=/tmp/spill"));
+  assert.deepEqual(args.slice(-2), ["--", "wrap up"]);
+  // The normal path is unchanged.
+  const normal = buildClaudeArgs({ prompt: "p", model: "m" });
+  assert.ok(normal.includes("--tools=Read,Glob,Grep"));
+  assert.ok(normal.some((arg) => arg.startsWith("--allowedTools=")));
+  // Tampered profiles are still rejected.
+  assert.throws(() => buildClaudeArgs({ prompt: "p", model: "m", profile: "root" }), /Unknown permission profile/);
+});
+
+test("createCallTracker records one call per message id with boundary-relative latency", () => {
+  let clock = 1000;
+  const tracker = createCallTracker({ now: () => clock });
+  const usage = (i, cr, cc, o) => ({ input_tokens: i, cache_read_input_tokens: cr, cache_creation_input_tokens: cc, output_tokens: o });
+
+  clock = 1300; // 300 ms after the spawn
+  tracker.onEvent({ type: "system", subtype: "init" });
+  tracker.onEvent({ type: "assistant", message: { id: "m1", usage: usage(5, 0, 7, 1) } });
+  clock = 1350;
+  tracker.onEvent({ type: "assistant", message: { id: "m1", usage: usage(5, 0, 7, 40) } });
+  clock = 1400;
+  tracker.onEvent({ type: "user", message: {} });
+  clock = 2900; // 1500 ms after the tool result
+  tracker.onEvent({ type: "assistant", message: { id: "m2", usage: usage(9, 100, 0, 12) } });
+  tracker.onEvent({ type: "assistant", message: { content: [] } }); // no id: ignored
+  tracker.onEvent(null);
+  tracker.onEvent({ type: "result" });
+
+  assert.deepEqual(tracker.calls(), [
+    { ms: 300, in: 5, cache_read: 0, cache_creation: 7, out: 40 },
+    { ms: 1500, in: 9, cache_read: 100, cache_creation: 0, out: 12 }
+  ]);
+});
+
+test("createCallTracker.start() restarts the latency boundary", () => {
+  let clock = 1000;
+  const tracker = createCallTracker({ now: () => clock });
+  clock = 6000; // a slow quota preflight before the spawn
+  tracker.start();
+  clock = 6200;
+  tracker.onEvent({ type: "assistant", message: { id: "m1", usage: { output_tokens: 1 } } });
+  assert.equal(tracker.calls()[0].ms, 200);
+});
+
+test("buildRunErrorText redacts before clipping", () => {
+  const key = "nano-secret-key-0123456789";
+  const stderr = `${"p".repeat(490)}${key}`;
+  const text = buildRunErrorText({
+    summary: null,
+    exitStatus: 1,
+    stderr,
+    redact: (value) => String(value).split(key).join("[redacted]")
+  });
+  assert.equal(text.includes("nano-secret"), false);
+  assert.ok(text.length <= 500);
+});
+
+test("createCallTracker defaults missing usage fields to 0", () => {
+  const tracker = createCallTracker({ now: () => 5 });
+  tracker.onEvent({ type: "assistant", message: { id: "x" } });
+  tracker.onEvent({ type: "assistant", message: { id: "y", usage: { output_tokens: 3 } } });
+  assert.deepEqual(tracker.calls(), [
+    { ms: 0, in: 0, cache_read: 0, cache_creation: 0, out: 0 },
+    { ms: 0, in: 0, cache_read: 0, cache_creation: 0, out: 3 }
+  ]);
+});
+
+test("percentile uses nearest rank and ignores non-numbers", () => {
+  assert.equal(percentile([], 50), null);
+  assert.equal(percentile([10, 20, 30, 40], 50), 20);
+  assert.equal(percentile([10, 20, 30, 40], 95), 40);
+  assert.equal(percentile([5, null, "x", 15], 50), 5);
+});
+
+test("buildRunErrorText covers errors, missing results and success", () => {
+  const base = { isError: true, text: "", subtype: "error_max_turns" };
+  assert.equal(buildRunErrorText({ summary: { ...base, text: "API Error: boom" } }), "API Error: boom");
+  assert.equal(buildRunErrorText({ summary: base, parsedErrors: ["Reached maximum number of turns (3)"] }), "Reached maximum number of turns (3)");
+  assert.equal(buildRunErrorText({ summary: base }), "error_max_turns");
+  assert.equal(buildRunErrorText({ summary: { isError: false, text: "fine" } }), null);
+  assert.equal(
+    buildRunErrorText({ summary: null, exitStatus: 1, stderr: "line1\n\nline2\nline3\nline4\nline5\nline6" }),
+    "claude exited 1: line1\nline2\nline3\nline4\nline5"
+  );
+  assert.equal(buildRunErrorText({ summary: { ...base, text: "x".repeat(900) } }).length, 500);
+});
+
+test("buildPingLogEntry records usage, timing and the scrubbed error", () => {
+  const now = new Date("2026-01-02T03:04:05.000Z");
+  const ok = buildPingLogEntry({
+    model: "m",
+    cwd: "/r",
+    ping: { ok: true, usage: { input_tokens: 9, output_tokens: 2 } },
+    ms: 321,
+    now
+  });
+  assert.equal(ok.kind, "ping");
+  assert.equal(ok.is_error, false);
+  assert.equal(ok.in, 9);
+  assert.equal(ok.out, 2);
+  assert.equal(ok.ms, 321);
+  assert.equal(ok.error, null);
+  const bad = buildPingLogEntry({ model: "m", cwd: "/r", ping: { ok: false, usage: null, detail: "HTTP 401: nope" }, ms: 5, now });
+  assert.equal(bad.is_error, true);
+  assert.equal(bad.error, "HTTP 401: nope");
+  assert.equal(bad.in, 0);
+});
+
+test("buildRunLogEntry records the new run fields and call stats", () => {
+  const entry = buildRunLogEntry({
+    model: "m",
+    cwd: "/r",
+    task: "t".repeat(400),
+    summary: {
+      isError: true,
+      numTurns: 16,
+      usage: { input_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 3, output_tokens: 4 },
+      durationMs: 9,
+      permissionDenials: [],
+      sessionId: "s",
+      subtype: "error_max_turns",
+      terminalReason: "max_turns"
+    },
+    kind: "review",
+    jobId: "review-1",
+    exit: 1,
+    error: "e".repeat(800),
+    promptBytes: 12,
+    spilledDiffBytes: 99,
+    wallMs: 1234,
+    maxTurns: 15,
+    stopReason: "max_turns",
+    salvaged: false,
+    calls: [
+      { ms: 100, in: 1, cache_read: 0, cache_creation: 0, out: 1 },
+      { ms: 900, in: 1, cache_read: 0, cache_creation: 0, out: 1 },
+      { ms: 300, in: 1, cache_read: 0, cache_creation: 0, out: 1 }
+    ]
+  });
+  assert.equal(entry.task.length, 300);
+  assert.equal(entry.error.length, 500);
+  assert.equal(entry.cache_creation, 3);
+  assert.equal(entry.subtype, "error_max_turns");
+  assert.equal(entry.terminalReason, "max_turns");
+  assert.equal(entry.stopReason, "max_turns");
+  assert.equal(entry.spilledDiffBytes, 99);
+  assert.equal(entry.callMsMax, 900);
+  assert.equal(entry.callMsP50, 300);
+});
+
+test("call tracker takes final per-call usage from the session transcript", () => {
+  // Real claude's stream-json assistant events carry message-start usage,
+  // which NanoGPT reports as zero; the transcript has the final counts.
+  const configDir = makeTempDir();
+  const cwd = makeTempDir();
+  const sessionId = "0b6f1c2d-aaaa-bbbb-cccc-1234567890ab";
+  const slugDir = path.join(configDir, "projects", fs.realpathSync(cwd).replace(/[^A-Za-z0-9]/g, "-"));
+  fs.mkdirSync(slugDir, { recursive: true });
+  const transcript = path.join(slugDir, `${sessionId}.jsonl`);
+  const usageA = { input_tokens: 32557, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 179 };
+  const usageB = { input_tokens: 1996, cache_read_input_tokens: 32704, cache_creation_input_tokens: 0, output_tokens: 1278 };
+  fs.writeFileSync(
+    transcript,
+    [
+      JSON.stringify({ type: "user", message: { content: "go" } }),
+      JSON.stringify({ type: "assistant", message: { id: "msg_a", usage: usageA } }),
+      JSON.stringify({ type: "assistant", message: { id: "msg_a", usage: usageA } }),
+      "not json",
+      JSON.stringify({ type: "assistant", message: { id: "msg_b", usage: usageB } })
+    ].join("\n") + "\n"
+  );
+
+  const env = { CLAUDE_CONFIG_DIR: configDir };
+  assert.equal(resolveSessionTranscript(sessionId, { cwd, env }), transcript);
+  assert.equal(resolveSessionTranscript("../../etc", { cwd, env }), null);
+  assert.equal(resolveSessionTranscript("ffffffff-0000", { cwd, env }), null);
+
+  let clock = 0;
+  const tracker = createCallTracker({ now: () => clock });
+  clock = 10;
+  tracker.onEvent({ type: "assistant", message: { id: "msg_a", usage: { input_tokens: 0, output_tokens: 0 } } });
+  tracker.onEvent({ type: "user" });
+  clock = 25;
+  tracker.onEvent({ type: "assistant", message: { id: "msg_b", usage: { input_tokens: 0, output_tokens: 0 } } });
+  tracker.onEvent({ type: "assistant", message: { id: "msg_c", usage: { input_tokens: 7, output_tokens: 3 } } });
+  tracker.applyUsage(readTranscriptUsage(transcript));
+
+  assert.deepEqual(tracker.calls(), [
+    { ms: 10, in: 32557, cache_read: 0, cache_creation: 0, out: 179 },
+    { ms: 15, in: 1996, cache_read: 32704, cache_creation: 0, out: 1278 },
+    // not in the transcript: keeps its stream values
+    { ms: 15, in: 7, cache_read: 0, cache_creation: 0, out: 3 }
+  ]);
+  assert.equal(readTranscriptUsage(null).size, 0);
+  assert.equal(readTranscriptUsage(path.join(configDir, "missing.jsonl")).size, 0);
 });

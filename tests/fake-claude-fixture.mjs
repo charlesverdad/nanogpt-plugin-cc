@@ -32,6 +32,10 @@ export const FAKE_API_KEY = "nano-test-key-DO-NOT-LEAK-7f3a";
  *   - "crash-after-init"  stream-json: print the init and one assistant
  *                 tool_use line, then exit 1 with NO result object (json:
  *                 print nothing, exit 1). Simulates claude dying mid-run.
+ *   - "no-result-error"  write nothing to stdout, write
+ *                 options.stderrText (default: real claude's 10 MB stdin
+ *                 refusal) to stderr, exit 1. Simulates claude refusing the
+ *                 prompt before returning any result.
  *
  * Each run-mode invocation appends ONE JSON line to
  * `<binDir>/claude-invocations.log` recording the argv it received and decoded
@@ -42,11 +46,22 @@ export const FAKE_API_KEY = "nano-test-key-DO-NOT-LEAK-7f3a";
  * `options.version` (default "2.1.278") overrides the --version string.
  * `options.resultText` overrides the "ok" result text.
  * `options.delayMs` (default 5000) is used by behavior "slow".
+ * `options.stderrText` overrides the stderr written by behavior
+ * "no-result-error".
+ * `options.salvage` controls how the "max-turns" behavior answers the
+ * turn-limit salvage call (a resume with an empty `--tools=`): "none"
+ * (default) hits the cap again, "ok" returns `options.salvageText` (default
+ * "Salvaged write-up."), "error" returns an is_error result, exit 1.
+ *
+ * Stream-json assistant events carry `message.id` and `message.usage` like real
+ * claude; the first call is split into two events with the same id.
  */
 export function installFakeClaude(binDir, behavior = "ok", options = {}) {
   const version = options.version ?? "2.1.278";
   const resultText = options.resultText ?? null;
   const delayMs = options.delayMs ?? 5000;
+  const stderrText =
+    options.stderrText ?? "Error: piped stdin input exceeds 10MB. Pass large content as a file path in your prompt instead.";
   const invocationsLog = path.join(binDir, "claude-invocations.log");
   const scriptPath = path.join(binDir, "claude");
   const source = `#!/usr/bin/env node
@@ -56,6 +71,9 @@ const BEHAVIOR = ${JSON.stringify(behavior)};
 const VERSION = ${JSON.stringify(version)};
 const RESULT_TEXT = ${JSON.stringify(resultText)};
 const DELAY_MS = ${JSON.stringify(delayMs)};
+const STDERR_TEXT = ${JSON.stringify(stderrText)};
+const SALVAGE = ${JSON.stringify(options.salvage ?? "none")};
+const SALVAGE_TEXT = ${JSON.stringify(options.salvageText ?? "Salvaged write-up.")};
 const INVOCATIONS_LOG = ${JSON.stringify(invocationsLog)};
 
 const argv = process.argv.slice(2);
@@ -110,6 +128,7 @@ if (argv[0] === "--help" || argv[0] === "-h") {
     "  --verbose                        verbose output",
     "  -r, --resume [value]             resume a session",
     "  --model <model>                  model to use",
+    "  --add-dir <directories...>       additional directories to allow tool access to",
     "  -v, --version                    print version",
     "",
     "Commands:",
@@ -138,7 +157,8 @@ function parseRunArgs(args) {
     restricted: false,
     strictMcpConfig: false,
     print: false,
-    prompt: null
+    prompt: null,
+    addDirs: []
   };
   let sawDashDash = false;
   for (let i = 0; i < args.length; i += 1) {
@@ -197,6 +217,8 @@ function parseRunArgs(args) {
       i += 1;
     } else if (token.startsWith("--max-turns=")) {
       parsed.maxTurns = token.slice("--max-turns=".length);
+    } else if (token.startsWith("--add-dir=")) {
+      parsed.addDirs.push(token.slice("--add-dir=".length));
     }
   }
   if (parsed.prompt === null && !sawDashDash) {
@@ -268,6 +290,7 @@ function recordInvocation() {
     verbose: run.verbose,
     resume: run.resume,
     maxTurns: run.maxTurns,
+    addDirs: run.addDirs,
     restricted: run.restricted,
     strictMcpConfig: run.strictMcpConfig,
     envNames: envNames,
@@ -291,6 +314,27 @@ function buildResultObject() {
   let result;
   let permission_denials = [];
   let exitCode = 0;
+
+  if (effBehavior === "max-turns" && run.tools === "" && SALVAGE !== "none") {
+    const failed = SALVAGE === "error";
+    return {
+      type: "result",
+      subtype: "success",
+      is_error: failed,
+      result: failed ? "API Error: salvage failed" : SALVAGE_TEXT,
+      session_id: sessionId,
+      num_turns: 1,
+      duration_ms: 321,
+      usage: {
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_input_tokens: 400,
+        cache_creation_input_tokens: 10
+      },
+      permission_denials: [],
+      _exitCode: failed ? 1 : 0
+    };
+  }
 
   if (effBehavior === "max-turns") {
     // Matches real claude when the --max-turns cap is hit: exit 1 with a
@@ -378,16 +422,18 @@ function emitStreamLines(resultObject) {
   const cwd = process.cwd();
   const lines = [];
   lines.push({ type: "system", subtype: "init", session_id: sessionId, model: run.model, cwd: cwd });
-  lines.push({ type: "assistant", session_id: sessionId, message: { role: "assistant", content: [
-    { type: "text", text: "Looking around." },
+  lines.push({ type: "assistant", session_id: sessionId, message: { id: "msg_1", role: "assistant", content: [
+    { type: "text", text: "Looking around." }
+  ], usage: { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 5, output_tokens: 1 } } });
+  lines.push({ type: "assistant", session_id: sessionId, message: { id: "msg_1", role: "assistant", content: [
     { type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: cwd + "/README.md" } }
-  ] } });
+  ], usage: { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 5, output_tokens: 20 } } });
   lines.push({ type: "user", session_id: sessionId, message: { role: "user", content: [
     { type: "tool_result", tool_use_id: "toolu_1", content: "ok" }
   ] } });
-  lines.push({ type: "assistant", session_id: sessionId, message: { role: "assistant", content: [
+  lines.push({ type: "assistant", session_id: sessionId, message: { id: "msg_2", role: "assistant", content: [
     { type: "tool_use", id: "toolu_2", name: "Bash", input: { command: "git diff --stat" } }
-  ] } });
+  ], usage: { input_tokens: 12, cache_read_input_tokens: 30, cache_creation_input_tokens: 0, output_tokens: 15 } } });
   lines.push(resultObject);
   return lines;
 }
@@ -411,7 +457,11 @@ function finish() {
   process.exit(exitCode);
 }
 
-if (BEHAVIOR === "crash-after-init") {
+if (BEHAVIOR === "no-result-error") {
+  recordInvocation();
+  process.stderr.write(STDERR_TEXT + "\\n");
+  process.exit(1);
+} else if (BEHAVIOR === "crash-after-init") {
   recordInvocation();
   if (run.outputFormat === "stream-json") {
     process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: run.model, cwd: process.cwd() }) + "\\n");

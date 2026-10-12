@@ -317,3 +317,18 @@ test("buildChildEnv raises the timeout and sets the key only in the child env", 
   assert.equal(DEFAULT_UPSTREAM.at(-1), "@nanogpt/mcp@1.5.0");
   assert.throws(() => parseUpstreamCommand({ NANO_MCP_UPSTREAM: "nope" }));
 });
+
+test(".mcp.json starts the proxy directly, so the script must stay executable", () => {
+  // The command names the script itself (no `node` + args): AgentShield flags
+  // `${...}` in MCP args as shell metacharacters. Claude Code spawns it without
+  // a shell, so it needs the exec bit and a node shebang.
+  const pluginRoot = path.join(ROOT, "plugins", "nano");
+  const config = JSON.parse(fs.readFileSync(path.join(pluginRoot, ".mcp.json"), "utf8"));
+  const server = config.mcpServers.nanogpt;
+  assert.equal(server.command, "${CLAUDE_PLUGIN_ROOT}/scripts/nanogpt-mcp-proxy.mjs");
+  assert.equal(server.args, undefined);
+  const script = server.command.replace("${CLAUDE_PLUGIN_ROOT}", pluginRoot);
+  assert.equal(script, PROXY);
+  assert.ok(fs.statSync(script).mode & 0o111, "proxy script must be executable");
+  assert.match(fs.readFileSync(script, "utf8").split("\n", 1)[0], /^#!\/usr\/bin\/env node$/);
+});

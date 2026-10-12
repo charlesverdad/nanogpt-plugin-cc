@@ -134,6 +134,18 @@ test("setup ready=true with all checks ok against the fake server", async () => 
     for (const check of payload.checks) {
       assert.equal(check.ok, true, `${check.id} should be ok: ${check.detail}`);
     }
+    // The live ping is recorded in the run log as kind "ping".
+    const pingEntries = fs
+      .readFileSync(path.join(rt.dataDir, "runs.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(pingEntries.length, 1);
+    assert.equal(pingEntries[0].kind, "ping");
+    assert.equal(pingEntries[0].model, "z-ai/glm-5.2");
+    assert.equal(pingEntries[0].is_error, false);
+    assert.equal(pingEntries[0].error, null);
+    assert.equal(typeof pingEntries[0].ms, "number");
     assert.equal(payload.defaultModel, "z-ai/glm-5.2");
     assert.equal(payload.catalogSource, "network");
     assert.equal(payload.reviewGateEnabled, false);
@@ -232,6 +244,12 @@ test("setup with unreachable server -> ping fails, not ready", () => {
   assert.equal(payload.ready, false);
   const pingCheck = payload.checks.find((c) => c.id === "ping");
   assert.equal(pingCheck.ok, false);
+
+  const logged = JSON.parse(fs.readFileSync(path.join(rt.dataDir, "runs.jsonl"), "utf8").trim().split("\n")[0]);
+  assert.equal(logged.kind, "ping");
+  assert.equal(logged.is_error, true);
+  assert.match(logged.error, /request failed/);
+  assert.equal(JSON.stringify(logged).includes(FAKE_API_KEY), false);
 });
 
 // ---------------------------------------------------------------------------

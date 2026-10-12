@@ -17,7 +17,10 @@ import {
   KEYCHAIN_SERVICE,
   STRIPPED_ENV_VARS,
   DEFAULT_BASH_ALLOW,
-  MAX_TURNS_LIMIT
+  MAX_TURNS_LIMIT,
+  DEFAULT_REVIEW_INLINE_BYTES,
+  MAX_PROMPT_BYTES,
+  resolveReviewInlineBytes
 } from "../plugins/nano/scripts/lib/runtime.mjs";
 
 function fakeRunCommandImpl(over = {}) {
@@ -458,6 +461,64 @@ test("buildClaudeArgs: --max-turns n goes right after --strict-mcp-config", () =
 test("buildClaudeArgs: with maxTurns null, no --max-turns flag is added", () => {
   const args = buildClaudeArgs({ prompt: "hi", model: "m" });
   assert.equal(args.includes("--max-turns"), false);
+});
+
+// ---------------------------------------------------------------------------
+// addDirs (--add-dir)
+// ---------------------------------------------------------------------------
+
+test("buildClaudeArgs: addDirs appends --add-dir=<dir> before the prompt", () => {
+  const args = buildClaudeArgs({ prompt: "hi", model: "m", addDirs: ["/tmp/nano-review-abc"] });
+  assert.deepEqual(args.filter((a) => a.startsWith("--add-dir=")), ["--add-dir=/tmp/nano-review-abc"]);
+  const addDirIdx = args.findIndex((a) => a.startsWith("--add-dir="));
+  const dashIdx = args.indexOf("--");
+  assert.ok(addDirIdx < dashIdx, "--add-dir must come before the -- prompt separator");
+});
+
+test("buildClaudeArgs: addDirs keeps order and repeats the flag", () => {
+  const args = buildClaudeArgs({ prompt: "hi", model: "m", addDirs: ["/a", "/b"] });
+  assert.deepEqual(args.filter((a) => a.startsWith("--add-dir=")), ["--add-dir=/a", "--add-dir=/b"]);
+});
+
+test("buildClaudeArgs: addDirs always uses the = form, never a bare --add-dir", () => {
+  const args = buildClaudeArgs({ prompt: "hi", model: "m", addDirs: ["/tmp/x"] });
+  assert.equal(args.includes("--add-dir"), false, "bare --add-dir is variadic and would swallow the prompt");
+});
+
+test("buildClaudeArgs: addDirs rejects a relative path", () => {
+  assert.throws(() => buildClaudeArgs({ prompt: "hi", model: "m", addDirs: ["relative/dir"] }), /absolute path/);
+});
+
+test("buildClaudeArgs: addDirs rejects paths with newlines or commas", () => {
+  assert.throws(() => buildClaudeArgs({ prompt: "hi", model: "m", addDirs: ["/tmp/a\nb"] }), /newlines or commas/);
+  assert.throws(() => buildClaudeArgs({ prompt: "hi", model: "m", addDirs: ["/tmp/a,b"] }), /newlines or commas/);
+});
+
+test("buildClaudeArgs: addDirs defaults to none", () => {
+  const args = buildClaudeArgs({ prompt: "hi", model: "m" });
+  assert.equal(args.some((a) => a.startsWith("--add-dir")), false);
+});
+
+// ---------------------------------------------------------------------------
+// review inline byte budget
+// ---------------------------------------------------------------------------
+
+test("DEFAULT_REVIEW_INLINE_BYTES is 200000 and MAX_PROMPT_BYTES sits below claude's 10 MB", () => {
+  assert.equal(DEFAULT_REVIEW_INLINE_BYTES, 200_000);
+  assert.equal(MAX_PROMPT_BYTES, 9_000_000);
+  assert.ok(MAX_PROMPT_BYTES < 10_000_000);
+});
+
+test("resolveReviewInlineBytes returns env value when a positive integer", () => {
+  assert.equal(resolveReviewInlineBytes({ NANO_REVIEW_INLINE_BYTES: "2000" }), 2000);
+});
+
+test("resolveReviewInlineBytes ignores invalid values and falls back to the default", () => {
+  assert.equal(resolveReviewInlineBytes({}), DEFAULT_REVIEW_INLINE_BYTES);
+  assert.equal(resolveReviewInlineBytes({ NANO_REVIEW_INLINE_BYTES: "0" }), DEFAULT_REVIEW_INLINE_BYTES);
+  assert.equal(resolveReviewInlineBytes({ NANO_REVIEW_INLINE_BYTES: "-5" }), DEFAULT_REVIEW_INLINE_BYTES);
+  assert.equal(resolveReviewInlineBytes({ NANO_REVIEW_INLINE_BYTES: "abc" }), DEFAULT_REVIEW_INLINE_BYTES);
+  assert.equal(resolveReviewInlineBytes({ NANO_REVIEW_INLINE_BYTES: "1.5" }), DEFAULT_REVIEW_INLINE_BYTES);
 });
 
 // ---------------------------------------------------------------------------

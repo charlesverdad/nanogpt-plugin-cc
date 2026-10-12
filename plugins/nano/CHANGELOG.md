@@ -1,9 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Logging MCP proxy (`.mcp.json`, `scripts/nanogpt-mcp-proxy.mjs`) around `@nanogpt/mcp@1.5.0`, exposed as `mcp__plugin_nano_nanogpt__*`. It logs every tool call with latency, usage and cost to `mcp-calls.jsonl`, injects `include_usage` into `nanogpt_chat`, takes the API key from the keychain instead of plaintext config, and raises the upstream timeout to 300 s.
 - Generated and edited images are archived locally with a JSON sidecar holding the original prompt and arguments, and the tool result tells Claude where the files are.
+- A run whose `claude` exits without a result (for example a prompt over claude's 10 MB stdin limit) reports claude's exit status and stderr instead of crashing with `Cannot read properties of null (reading 'usage')`.
+- Review diffs no longer use `--binary` (a binary file is one "Binary files … differ" line), lockfiles are left out of the inline diff by default, and `--exclude <glob>` (repeatable) leaves out more. Omitted files are still in the diff stat and are listed.
+- A diff over `NANO_REVIEW_INLINE_BYTES` (default 200000) is written to a private temp file that the model reads via `--add-dir`, instead of being inlined. A prompt over 9 MB fails early with a clear message.
+- `task --prompt-file <path>`, `adversarial-review --focus-file <path>`, and `--out <path>` (writes only the model's final text, and only for a successful run).
+- Clearer error for `--read-only` combined with `--allow-bash`.
+- Turn-limit salvage: a review or task that hits `--max-turns` is resumed once with no tools (`--tools=`, `--max-turns 1`) and asked to write up what it found. Text from that call becomes the result (exit 0, with a "Finalized at the turn limit" / "Stopped at the turn limit ... Summary of progress" note); the payload keeps `stopReason: "max_turns"` and gains `salvaged` and `salvageUsage`, and `usage` is the sum of both calls. The stop-time gate salvages too. `--no-salvage` turns it off; a failed salvage behaves as before.
+- Every run now streams (`stream-json --verbose`), so reviews and foreground tasks also report progress, and per-API-call latency and tokens are recorded.
+- `runs.jsonl` gains `kind jobId exit subtype terminalReason stopReason error cache_creation promptBytes spilledDiffBytes wallMs maxTurns salvaged salvage calls callMsMax callMsP50` (existing fields unchanged). The `/nano:setup` live ping is logged as `kind: "ping"`.
+- `/nano:usage [--days <n>] [--json]` (`nano-companion.mjs usage`) reports totals, runs by kind and model, failures by cause, API-call latency, the slowest runs and MCP tool usage from `runs.jsonl` and `mcp-calls.jsonl`.
+- The API key is scrubbed from claude's stdout and stderr before anything is parsed, rendered or stored. `--out` writes atomically, refuses a symlink or directory destination, and fails the run when it can't write.
+- The `nano-runtime` skill opens with a "Before you delegate" guide for the caller: measured quota cost by run size, good and bad fits, and how to write a single-deliverable, self-contained task. The `nano:nano-rescue` description points to it.
 
 ## 0.1.0
 

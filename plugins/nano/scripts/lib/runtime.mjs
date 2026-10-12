@@ -7,7 +7,8 @@
 // See .claude/LEARNINGS.md for the verified runtime facts behind each flag.
 
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -26,6 +27,20 @@ export const API_TIMEOUT_MS = "600000";
 export const DEFAULT_TASK_MAX_TURNS = 25;
 export const DEFAULT_REVIEW_MAX_TURNS = 15;
 export const MAX_TURNS_LIMIT = 500;
+
+// Above this many UTF-8 bytes, a review's inline diff is spilled to a file
+// (review.diff in a private temp dir) and the prompt points claude at it
+// instead of inlining the whole diff. Real `claude` refuses stdin prompts
+// larger than 10 MB, and a branch with committed PNGs/base85 lockfiles can
+// easily reach that, so the default is far below the hard limit. Overridable
+// with NANO_REVIEW_INLINE_BYTES (positive integer; invalid values are
+// ignored).
+export const DEFAULT_REVIEW_INLINE_BYTES = 200_000;
+
+// Hard ceiling before spawning: real claude exits 1 with "piped stdin input
+// exceeds 10MB" on a stdin prompt over 10 MB. We refuse a little below that so
+// the error message is ours, not claude's.
+export const MAX_PROMPT_BYTES = 9_000_000;
 
 // Host settings that would route the child to a different provider or a paid
 // Claude model. They are removed before ours are applied.
@@ -48,6 +63,15 @@ export const READ_TOOLS = Object.freeze(["Read", "Glob", "Grep"]);
 export const DEFAULT_BASH_ALLOW = Object.freeze(["git status", "ls"]);
 export const PROFILES = Object.freeze(["read", "write"]);
 export const OUTPUT_FORMATS = Object.freeze(["json", "stream-json"]);
+
+// Prompts for the no-tools call that resumes a session which hit the turn cap
+// and asks the model to write up what it already found.
+export const REVIEW_SALVAGE_PROMPT =
+  "You have reached the turn limit. Do not call any tools. Write your final review now, in the required output format, based only on what you have already examined. End with a short list of areas you did not get to check.";
+export const TASK_SALVAGE_PROMPT =
+  "You have reached the turn limit. Do not call any tools. Summarize what you did, which files you changed, what you verified, and what remains to be done.";
+export const STOP_GATE_SALVAGE_PROMPT =
+  "You have reached the turn limit. Do not call any tools. Give your final verdict now, based only on what you have already examined. The first line of your reply must be exactly `ALLOW: <short reason>` or `BLOCK: <short reason>`.";
 
 export function getClaudeAvailability(cwd) {
   return binaryAvailable("claude", ["--version"], { cwd });
@@ -235,6 +259,16 @@ export function isMaxTurnsStop(summary) {
  * the child's stdin instead (for prompts too large for a single argv entry).
  * `maxTurns` (null = no cap flag) adds `--max-turns <n>` right after
  * `--strict-mcp-config`.
+ *
+ * `noTools` (used for the turn-limit salvage call) emits an empty `--tools=`
+ * (which disables every tool) and no `--allowedTools`; the profile is ignored.
+ *
+ * `addDirs` appends `--add-dir=<dir>` for each entry (always the `=` form:
+ * `--add-dir` is variadic and would otherwise swallow the prompt). The child
+ * runs under `--restricted`, which denies Read outside the working directory;
+ * `--add-dir` grants read access to exactly that directory, used to let claude
+ * read a spilled review diff. Non-absolute paths and paths containing newlines
+ * or commas are rejected.
  */
 export function buildClaudeArgs({
   prompt,
@@ -244,7 +278,9 @@ export function buildClaudeArgs({
   resumeSessionId = null,
   outputFormat = "json",
   promptViaStdin = false,
-  maxTurns = null
+  maxTurns = null,
+  addDirs = [],
+  noTools = false
 } = {}) {
   if (!model) {
     throw new Error("buildClaudeArgs requires a model.");
@@ -256,7 +292,11 @@ export function buildClaudeArgs({
     throw new Error(`Unsupported output format "${outputFormat}".`);
   }
   const maxTurnsValue = normalizeMaxTurns(maxTurns);
-  const permissions = typeof profile === "object" ? profile : buildPermissionProfile(profile, { bashAllow });
+  const permissions = noTools
+    ? { tools: [], allowedTools: [] }
+    : typeof profile === "object"
+      ? profile
+      : buildPermissionProfile(profile, { bashAllow });
 
   const args = [
     "-p",
@@ -268,7 +308,7 @@ export function buildClaudeArgs({
     `--tools=${permissions.tools.join(",")}`,
     "--permission-mode",
     "dontAsk",
-    `--allowedTools=${permissions.allowedTools.join(",")}`,
+    ...(noTools ? [] : [`--allowedTools=${permissions.allowedTools.join(",")}`]),
     "--output-format",
     outputFormat
   ];
@@ -277,6 +317,15 @@ export function buildClaudeArgs({
   }
   if (resumeSessionId) {
     args.push("--resume", String(resumeSessionId));
+  }
+  for (const dir of addDirs) {
+    if (typeof dir !== "string" || !path.isAbsolute(dir)) {
+      throw new Error(`--add-dir requires an absolute path: ${JSON.stringify(dir)}.`);
+    }
+    if (dir.includes("\n") || dir.includes(",")) {
+      throw new Error(`--add-dir path must not contain newlines or commas: ${JSON.stringify(dir)}.`);
+    }
+    args.push(`--add-dir=${dir}`);
   }
   if (!promptViaStdin) {
     args.push("--", prompt);
@@ -311,6 +360,23 @@ export function resolveMaxInlineChars(env = process.env) {
     return value;
   }
   return DEFAULT_MAX_INLINE_CHARS;
+}
+
+/**
+ * Byte budget for inlining a review diff (overridable via
+ * NANO_REVIEW_INLINE_BYTES). Only a whole positive integer counts; anything
+ * else (0, negative, fractional, non-numeric) is ignored so a typo never
+ * disables the spill-to-file behaviour.
+ */
+export function resolveReviewInlineBytes(env = process.env) {
+  const raw = String(env.NANO_REVIEW_INLINE_BYTES ?? "").trim();
+  if (/^\d+$/.test(raw)) {
+    const value = Number(raw);
+    if (value > 0) {
+      return value;
+    }
+  }
+  return DEFAULT_REVIEW_INLINE_BYTES;
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +553,161 @@ export function summarizeClaudeResult(result) {
   };
 }
 
+/**
+ * Nearest-rank percentile of a list of numbers (`p` in 0..100). Returns null
+ * for an empty list.
+ */
+export function percentile(values, p) {
+  const sorted = values.filter((value) => typeof value === "number" && Number.isFinite(value)).sort((a, b) => a - b);
+  if (sorted.length === 0) {
+    return null;
+  }
+  const rank = Math.max(1, Math.ceil((p / 100) * sorted.length));
+  return sorted[Math.min(rank, sorted.length) - 1];
+}
+
+/**
+ * Per-API-call metrics from a `stream-json` run. Feed it every parsed stream
+ * event; `calls()` returns one `{ ms, in, cache_read, cache_creation, out }`
+ * entry per distinct assistant `message.id`, in order.
+ *
+ * `ms` is the wall time from the previous boundary (the tracker's creation or
+ * last `start()`, i.e. the spawn, or the last `user`/tool-result event) to the first event of
+ * that message id. Real claude can emit several assistant events (one per
+ * content block) with the same id: they are one call, and the token counts
+ * come from the last event seen for the id.
+ */
+export function createCallTracker({ now = Date.now } = {}) {
+  let boundary = now();
+  const byId = new Map();
+  const list = [];
+  return {
+    /** Restart the latency boundary, e.g. right before spawning claude. */
+    start() {
+      boundary = now();
+    },
+    onEvent(event) {
+      if (!event || typeof event !== "object") {
+        return;
+      }
+      if (event.type === "user") {
+        boundary = now();
+        return;
+      }
+      if (event.type !== "assistant") {
+        return;
+      }
+      const id = event.message?.id;
+      if (typeof id !== "string" || !id) {
+        return;
+      }
+      let call = byId.get(id);
+      if (!call) {
+        call = { ms: Math.max(0, now() - boundary), in: 0, cache_read: 0, cache_creation: 0, out: 0 };
+        byId.set(id, call);
+        list.push({ id, call });
+      }
+      const usage = event.message?.usage;
+      if (usage && typeof usage === "object") {
+        call.in = Number(usage.input_tokens) || 0;
+        call.cache_read = Number(usage.cache_read_input_tokens) || 0;
+        call.cache_creation = Number(usage.cache_creation_input_tokens) || 0;
+        call.out = Number(usage.output_tokens) || 0;
+      }
+    },
+    /**
+     * Overwrite per-call tokens with final usage keyed by message id (see
+     * readTranscriptUsage). Calls without an entry keep their stream values.
+     */
+    applyUsage(usageById) {
+      for (const { id, call } of list) {
+        const usage = usageById?.get(id);
+        if (usage) {
+          call.in = Number(usage.input_tokens) || 0;
+          call.cache_read = Number(usage.cache_read_input_tokens) || 0;
+          call.cache_creation = Number(usage.cache_creation_input_tokens) || 0;
+          call.out = Number(usage.output_tokens) || 0;
+        }
+      }
+    },
+    calls() {
+      return list.map(({ call }) => ({ ...call }));
+    }
+  };
+}
+
+/**
+ * Path of a headless run's session transcript, or null. Claude Code writes it
+ * to `<config dir>/projects/<cwd with non-alphanumerics as "-">/<session>.jsonl`;
+ * if that guess misses (e.g. a symlinked cwd), the project dirs are scanned.
+ */
+export function resolveSessionTranscript(sessionId, { cwd = process.cwd(), env = process.env } = {}) {
+  if (typeof sessionId !== "string" || !/^[0-9A-Za-z-]{8,}$/.test(sessionId)) {
+    return null;
+  }
+  const projectsDir = path.join(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "projects");
+  const fileName = `${sessionId}.jsonl`;
+  try {
+    const candidates = [cwd];
+    try {
+      candidates.push(realpathSync(cwd));
+    } catch {
+      // keep the unresolved cwd only
+    }
+    for (const dir of candidates) {
+      const file = path.join(projectsDir, String(dir).replace(/[^A-Za-z0-9]/g, "-"), fileName);
+      if (existsSync(file)) {
+        return file;
+      }
+    }
+    for (const entry of readdirSync(projectsDir)) {
+      const file = path.join(projectsDir, entry, fileName);
+      if (existsSync(file)) {
+        return file;
+      }
+    }
+  } catch {
+    // no transcript directory
+  }
+  return null;
+}
+
+/**
+ * Final usage per assistant message id from a session transcript. Stream-json
+ * `assistant` events carry the usage known when the message started, and
+ * NanoGPT reports tokens only at the end of a message, so their counts are
+ * zero; the transcript has the final values. Never throws: returns an empty
+ * map on any error.
+ */
+export function readTranscriptUsage(file) {
+  const usageById = new Map();
+  if (!file) {
+    return usageById;
+  }
+  let text;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return usageById;
+  }
+  for (const line of text.split("\n")) {
+    if (!line.includes('"assistant"')) {
+      continue;
+    }
+    try {
+      const entry = JSON.parse(line);
+      const id = entry?.message?.id;
+      const usage = entry?.message?.usage;
+      if (entry?.type === "assistant" && typeof id === "string" && usage && typeof usage === "object") {
+        usageById.set(id, usage);
+      }
+    } catch {
+      // skip unparseable lines
+    }
+  }
+  return usageById;
+}
+
 // ---------------------------------------------------------------------------
 // run metrics log (mirrors bin/nano-agent's runs.jsonl)
 // ---------------------------------------------------------------------------
@@ -495,7 +716,57 @@ export function resolveRunLogFile(env = process.env) {
   return path.join(env.CLAUDE_PLUGIN_DATA || resolveFallbackDataDir(), "runs.jsonl");
 }
 
-export function buildRunLogEntry({ model, cwd, allowedTools = [], task = "", summary, quotaDelta = null, now = new Date() }) {
+const LOG_ERROR_MAX_CHARS = 500;
+
+function clipLogText(text, limit = LOG_ERROR_MAX_CHARS) {
+  const value = String(text ?? "").trim();
+  return value.length > limit ? value.slice(0, limit) : value;
+}
+
+/**
+ * The run-log error text: the result text when the run reported `is_error`
+ * (falling back to claude's `errors`/subtype when that is empty, as at the
+ * turn cap), `claude exited <n>: <first lines of stderr>` when there is no
+ * result object, otherwise null. At most 500 chars.
+ */
+export function buildRunErrorText({ summary, parsedErrors = [], exitStatus = null, stderr = "", redact = null } = {}) {
+  // Redact before clipping: a secret straddling the limit must not leak a prefix.
+  const clip = (text) => clipLogText(typeof redact === "function" ? redact(text) : text);
+  if (!summary) {
+    const head = String(stderr ?? "").split("\n").filter((line) => line.trim()).slice(0, 5).join("\n");
+    return clip(`claude exited ${exitStatus ?? "?"}${head ? `: ${head}` : ""}`);
+  }
+  if (summary.isError) {
+    const text = String(summary.text ?? "").trim();
+    const errors = Array.isArray(parsedErrors) ? parsedErrors.map(String).join("; ") : "";
+    return clip(text || errors || summary.subtype || "error");
+  }
+  return null;
+}
+
+export function buildRunLogEntry({
+  model,
+  cwd,
+  allowedTools = [],
+  task = "",
+  summary,
+  quotaDelta = null,
+  now = new Date(),
+  kind = null,
+  jobId = null,
+  exit = null,
+  error = null,
+  promptBytes = null,
+  spilledDiffBytes = null,
+  wallMs = null,
+  maxTurns = null,
+  stopReason = null,
+  salvaged = null,
+  salvage = null,
+  calls = []
+}) {
+  const usage = summary.usage ?? {};
+  const callMs = calls.map((call) => call.ms);
   return {
     ts: now.toISOString(),
     model,
@@ -503,14 +774,54 @@ export function buildRunLogEntry({ model, cwd, allowedTools = [], task = "", sum
     tools: allowedTools.join(","),
     is_error: summary.isError,
     turns: summary.numTurns,
-    in: summary.usage.input_tokens ?? 0,
-    cache_read: summary.usage.cache_read_input_tokens ?? 0,
-    out: summary.usage.output_tokens ?? 0,
+    in: usage.input_tokens ?? 0,
+    cache_read: usage.cache_read_input_tokens ?? 0,
+    out: usage.output_tokens ?? 0,
     ms: summary.durationMs,
     denials: summary.permissionDenials.length,
     session: summary.sessionId,
     quotaDelta,
-    task: String(task).slice(0, 300)
+    task: String(task).slice(0, 300),
+    kind,
+    jobId,
+    exit,
+    subtype: summary.subtype ?? null,
+    terminalReason: summary.terminalReason ?? null,
+    stopReason,
+    error: error == null ? null : clipLogText(error),
+    cache_creation: usage.cache_creation_input_tokens ?? 0,
+    promptBytes,
+    spilledDiffBytes,
+    wallMs,
+    maxTurns,
+    salvaged,
+    salvage,
+    calls,
+    callMsMax: callMs.length > 0 ? Math.max(...callMs) : null,
+    callMsP50: percentile(callMs, 50)
+  };
+}
+
+/**
+ * Run-log entry for the `setup` live ping: the same base fields as a run plus
+ * `kind: "ping"`. `ping` is the pingNanoGpt result (its `detail` is already
+ * key-scrubbed); `ms` is the measured wall time.
+ */
+export function buildPingLogEntry({ model, cwd, ping, ms, now = new Date() }) {
+  const usage = ping?.usage && typeof ping.usage === "object" ? ping.usage : {};
+  return {
+    ts: now.toISOString(),
+    model,
+    cwd,
+    kind: "ping",
+    is_error: !ping?.ok,
+    in: Number(usage.input_tokens) || 0,
+    cache_read: Number(usage.cache_read_input_tokens) || 0,
+    cache_creation: Number(usage.cache_creation_input_tokens) || 0,
+    out: Number(usage.output_tokens) || 0,
+    ms,
+    wallMs: ms,
+    error: ping?.ok ? null : clipLogText(ping?.detail ?? "ping failed")
   };
 }
 

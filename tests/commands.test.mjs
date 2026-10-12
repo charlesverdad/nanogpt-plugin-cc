@@ -50,7 +50,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
-  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[--max-turns <n>\] \[focus \.\.\.\]/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[--max-turns <n>\] \[--no-salvage\] \[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/nano-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"NanoGPT adversarial review"/);
@@ -76,7 +76,8 @@ test("commands directory exposes the expected user-facing commands", () => {
     "result.md",
     "review.md",
     "setup.md",
-    "status.md"
+    "status.md",
+    "usage.md"
   ]);
 });
 
@@ -150,6 +151,7 @@ test("rescue command forwards to the nano-rescue subagent verbatim", () => {
   assert.match(readme, /### \/nano:status/);
   assert.match(readme, /### \/nano:result/);
   assert.match(readme, /### \/nano:cancel/);
+  assert.match(readme, /### \/nano:usage/);
   assert.match(readme, /uses the same target selection as `\/nano:review`/i);
   assert.match(readme, /the NanoGPT model can read files but cannot edit them or run commands/i);
   assert.match(readme, /\| `read` \|/);
@@ -168,6 +170,14 @@ test("result and cancel commands are deterministic runtime entrypoints", () => {
   assert.match(result, /nano-companion\.mjs" result "\$ARGUMENTS"/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /nano-companion\.mjs" cancel "\$ARGUMENTS"/);
+});
+
+test("usage command runs the companion usage subcommand", () => {
+  const usage = read("commands/usage.md");
+  assert.match(usage, /disable-model-invocation:\s*true/);
+  assert.match(usage, /argument-hint: '\[--days <n>\] \[--json\]'/);
+  assert.match(usage, /allowed-tools:\s*Bash\(node:\*\)\s*$/m);
+  assert.match(usage, /nano-companion\.mjs" usage "\$ARGUMENTS"/);
 });
 
 test("internal runtime skill uses task terminology for rescue runs", () => {
@@ -232,4 +242,26 @@ test("nano-rescue agent uses model: haiku and documents the direct companion tas
   assert.match(runtimeSkill, /--allow-paid/);
   assert.match(runtimeSkill, /--json/);
   assert.match(runtimeSkill, /denied=\.\.\./);
+});
+
+test("nano-runtime skill opens with a caller-facing delegation guide", () => {
+  const runtimeSkill = read("skills/nano-runtime/SKILL.md");
+  const agent = read("agents/nano-rescue.md");
+
+  // The description must make the main thread load the skill before delegating.
+  assert.match(runtimeSkill, /^description:.*scope a task before handing it to NanoGPT/m);
+  const guide = runtimeSkill.indexOf("## Before you delegate");
+  assert.ok(guide > 0 && guide < runtimeSkill.indexOf("## Execution"), "guide comes before the forwarder rules");
+  assert.match(runtimeSkill, /counts cached input in full/);
+  assert.match(runtimeSkill, /205 turns \| 21\.5M/);
+  assert.match(runtimeSkill, /One deliverable per task/);
+  assert.match(runtimeSkill, /Make it self-contained/);
+  assert.match(runtimeSkill, /--prompt-file/);
+  assert.match(runtimeSkill, /--out <file>/);
+  assert.match(runtimeSkill, /Prefer a fresh task over repeated `--continue`/);
+  // Running tests stays a user decision (see the allowlist rule).
+  assert.match(runtimeSkill, /only the user can approve/);
+
+  assert.match(agent, /one self-contained deliverable with exact file paths/);
+  assert.match(agent, /nano:nano-runtime skill before writing the task/);
 });

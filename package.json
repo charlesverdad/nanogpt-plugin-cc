@@ -1,6 +1,6 @@
 {
   "name": "nanogpt-plugin-cc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Hand off tasks and code reviews from Claude Code to NanoGPT subscription models.",
