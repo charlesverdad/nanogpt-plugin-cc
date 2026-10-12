@@ -283,7 +283,7 @@ Measured over the 20 delegated runs that built this plugin, 83.6% of all input t
 | 37-turn task | 71k | 681k | 5.4x |
 | 72-turn task | 97k | 3.84M | 8.2x |
 
-So a one-shot call costs what it would anywhere, while a long agentic run costs up to about 8x more. That 72-turn task used 3.93M tokens, 6.6% of a 60M weekly quota, in one delegation; a review costs about 84k, or 0.14%. Keep delegated tasks short and well scoped: give exact file paths and the verify command so turns aren't spent exploring, lower `--max-turns` for scoped work, and remember that a 2x model multiplier stacks on top of this.
+So a one-shot call costs what it would anywhere, while a long agentic run costs up to about 8x more. That 72-turn task used 3.93M tokens, 6.6% of a 60M weekly quota, in one delegation; a review costs about 84k, or 0.14%. Keep delegated tasks short and well scoped: give exact file paths and the verify command so turns aren't spent exploring, lower `--max-turns` for scoped work, and remember that a 2x model multiplier stacks on top of this. The worst measured case was one spec with six features: 205 turns and 21.5M input tokens, 36% of the week. The `nano-runtime` skill gives Claude these scoping rules before it writes a task for NanoGPT.
 
 **Thinking mode:** `--thinking` selects the `<model>:thinking` variant when it exists in the catalog. If no thinking variant exists, a warning is printed and the base model runs.
 

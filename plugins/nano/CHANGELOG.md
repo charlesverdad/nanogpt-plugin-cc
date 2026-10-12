@@ -13,6 +13,8 @@
 - Every run now streams (`stream-json --verbose`), so reviews and foreground tasks also report progress, and per-API-call latency and tokens are recorded.
 - `runs.jsonl` gains `kind jobId exit subtype terminalReason stopReason error cache_creation promptBytes spilledDiffBytes wallMs maxTurns salvaged salvage calls callMsMax callMsP50` (existing fields unchanged). The `/nano:setup` live ping is logged as `kind: "ping"`.
 - `/nano:usage [--days <n>] [--json]` (`nano-companion.mjs usage`) reports totals, runs by kind and model, failures by cause, API-call latency, the slowest runs and MCP tool usage from `runs.jsonl` and `mcp-calls.jsonl`.
+- The API key is scrubbed from claude's stdout and stderr before anything is parsed, rendered or stored. `--out` writes atomically, refuses a symlink or directory destination, and fails the run when it can't write.
+- The `nano-runtime` skill opens with a "Before you delegate" guide for the caller: measured quota cost by run size, good and bad fits, and how to write a single-deliverable, self-contained task. The `nano:nano-rescue` description points to it.
 
 ## 0.1.0
 

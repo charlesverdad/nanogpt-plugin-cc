@@ -243,3 +243,25 @@ test("nano-rescue agent uses model: haiku and documents the direct companion tas
   assert.match(runtimeSkill, /--json/);
   assert.match(runtimeSkill, /denied=\.\.\./);
 });
+
+test("nano-runtime skill opens with a caller-facing delegation guide", () => {
+  const runtimeSkill = read("skills/nano-runtime/SKILL.md");
+  const agent = read("agents/nano-rescue.md");
+
+  // The description must make the main thread load the skill before delegating.
+  assert.match(runtimeSkill, /^description:.*scope a task before handing it to NanoGPT/m);
+  const guide = runtimeSkill.indexOf("## Before you delegate");
+  assert.ok(guide > 0 && guide < runtimeSkill.indexOf("## Execution"), "guide comes before the forwarder rules");
+  assert.match(runtimeSkill, /counts cached input in full/);
+  assert.match(runtimeSkill, /205 turns \| 21\.5M/);
+  assert.match(runtimeSkill, /One deliverable per task/);
+  assert.match(runtimeSkill, /Make it self-contained/);
+  assert.match(runtimeSkill, /--prompt-file/);
+  assert.match(runtimeSkill, /--out <file>/);
+  assert.match(runtimeSkill, /Prefer a fresh task over repeated `--continue`/);
+  // Running tests stays a user decision (see the allowlist rule).
+  assert.match(runtimeSkill, /only the user can approve/);
+
+  assert.match(agent, /one self-contained deliverable with exact file paths/);
+  assert.match(agent, /nano:nano-runtime skill before writing the task/);
+});
