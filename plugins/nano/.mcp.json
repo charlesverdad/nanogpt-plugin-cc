@@ -1,0 +1,1 @@
+{"mcpServers":{"nanogpt":{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/scripts/nanogpt-mcp-proxy.mjs"],"env":{"NANO_PROJECT_DIR":"${CLAUDE_PROJECT_DIR}"}}}}
