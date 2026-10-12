@@ -32,3 +32,4 @@
 - `claude plugin update` compares the version field: merging new code without a version bump reports "already at the latest version".
 - Auto mode blocks `gh pr merge` as "Merge Without Review" even when the user asked for the merge; get a real review on the PR first.
 - One nano spec with six features cost 205 turns and 21.5M input tokens (36% of the weekly quota). Keep nano specs to a single feature, or give multi-feature work to a Sonnet subagent.
+- AgentShield flags `${CLAUDE_PLUGIN_ROOT}` inside MCP server `args` as shell metacharacters (medium, fails CI). Put the executable script (exec bit + `#!/usr/bin/env node`) in `command` with no args.
