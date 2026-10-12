@@ -136,14 +136,37 @@ export function renderSetupReport(report) {
  * Fallback body used when a `claude` run produced no parseable JSON result
  * (a crash, a timeout, or a non-JSON stdout). There is no footer in this
  * case: without a result object there are no turns/tokens/session to report.
+ *
+ * When `exitStatus` is given, an extra line names it (`claude exited with
+ * status <n> before returning a result`) so the calling agent sees why claude
+ * produced nothing instead of a generic "did not return a result". The stderr
+ * (or stdout fallback) is capped at its first 20 lines so a verbose failure
+ * cannot drown the message.
  */
-export function renderNoResultBody({ stdout = "", stderr = "" } = {}) {
-  const tail = String(stderr ?? "").trim() || String(stdout ?? "").trim();
+export function renderNoResultBody({ stdout = "", stderr = "", exitStatus = null } = {}) {
   const lines = ["NanoGPT did not return a result."];
+  if (exitStatus !== null && exitStatus !== undefined) {
+    lines.push("", `claude exited with status ${exitStatus} before returning a result`);
+  }
+  const tail = String(stderr ?? "").trim() || String(stdout ?? "").trim();
   if (tail) {
-    lines.push("", "```text", tail, "```");
+    const tailLines = tail.split("\n").slice(0, 20).join("\n");
+    lines.push("", "```text", tailLines, "```");
   }
   return `${lines.join("\n")}\n`;
+}
+
+/**
+ * One-line-ish error string for a run that produced no result object: the
+ * status line plus the filtered stderr (first 20 lines). Used for the job
+ * `summary` and the payload `error` field so the calling agent gets claude's
+ * real failure (e.g. "piped stdin input exceeds 10MB") instead of "empty
+ * response".
+ */
+export function buildNoResultError(exitStatus, stderr = "") {
+  const head = `claude exited with status ${exitStatus} before returning a result`;
+  const tail = String(stderr ?? "").split("\n").slice(0, 20).join("\n").trim();
+  return tail ? `${head}\n${tail}` : head;
 }
 
 /**
@@ -151,11 +174,11 @@ export function renderNoResultBody({ stdout = "", stderr = "" } = {}) {
  * (untruncated) result text, and the run footer. When there is no parseable
  * result, falls back to `renderNoResultBody` with no footer.
  */
-export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null } = {}) {
+export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null, exitStatus = null } = {}) {
   const lines = [`# NanoGPT ${reviewLabel}`, "", `Target: ${targetLabel}`, ""];
 
   if (!summary) {
-    lines.push(renderNoResultBody({ stdout, stderr }).trimEnd());
+    lines.push(renderNoResultBody({ stdout, stderr, exitStatus }).trimEnd());
     const trimmed = lines.join("\n").trimEnd();
     return `${trimmed}\n`;
   }
@@ -181,9 +204,9 @@ export function renderReviewResult({ reviewLabel, targetLabel, summary, model, s
  * Falls back to `renderNoResultBody` (no footer) when there is no parseable
  * result at all.
  */
-export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null } = {}) {
+export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null, exitStatus = null } = {}) {
   if (!summary) {
-    return { rendered: renderNoResultBody({ stdout, stderr }), footer: null };
+    return { rendered: renderNoResultBody({ stdout, stderr, exitStatus }), footer: null };
   }
 
   const footer = renderRunFooter({ model, summary, quota });
@@ -350,13 +373,16 @@ export function formatDenials(denials = []) {
  * reset mid-run) and `week=<percent>%` (omitted when not computable).
  */
 export function renderRunFooter({ model, summary, quota = null }) {
-  const usage = summary.usage ?? {};
+  // `summary` is null when claude printed no result object (a crash, a
+  // refused prompt, ...). Render it as if usage/turns/session are unknown
+  // rather than throwing, so the failure path can still print a footer.
+  const usage = summary?.usage ?? {};
   const inputTokens = usage.input_tokens ?? 0;
   const cacheRead = usage.cache_read_input_tokens ?? 0;
   const outputTokens = usage.output_tokens ?? 0;
-  const numTurns = summary.numTurns ?? "?";
-  const secs = Math.floor((summary.durationMs ?? 0) / 1000);
-  const session = summary.sessionId ?? "none";
+  const numTurns = summary?.numTurns ?? "?";
+  const secs = Math.floor((summary?.durationMs ?? 0) / 1000);
+  const session = summary?.sessionId ?? "none";
   let footer = `[nano] model=${model} turns=${numTurns} tokens=${inputTokens + cacheRead}in/${outputTokens}out secs=${secs} session=${session}`;
   if (quota && typeof quota.delta === "number" && quota.delta >= 0) {
     footer += ` quota=+${formatTokenCount(quota.delta)}`;
@@ -364,7 +390,7 @@ export function renderRunFooter({ model, summary, quota = null }) {
   if (quota && typeof quota.weekPercent === "number") {
     footer += ` week=${quota.weekPercent}%`;
   }
-  if (Array.isArray(summary.permissionDenials) && summary.permissionDenials.length > 0) {
+  if (Array.isArray(summary?.permissionDenials) && summary.permissionDenials.length > 0) {
     footer += ` denied=${formatDenials(summary.permissionDenials)}`;
   }
   return footer;

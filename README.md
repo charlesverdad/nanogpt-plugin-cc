@@ -85,7 +85,7 @@ The key is resolved fresh for each run and is never written to job files, logs, 
 ### /nano:rescue
 
 ```
-/nano:rescue [--background|--wait] [--continue|--fresh] [--model <id|alias>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] <task>
+/nano:rescue [--background|--wait] [--continue|--fresh] [--model <id|alias>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [--prompt-file <path>] [--out <path>] <task>
 ```
 
 Hands a task to NanoGPT through the `nano:nano-rescue` subagent. **This only ever runs when you ask for it** — by name (`/nano:rescue`) or by telling Claude to hand something to NanoGPT; Claude does not use it proactively, and it is meant for short, well-scoped tasks. Use it to investigate a bug, try a fix, or continue a previous NanoGPT session. By default the task runs in the foreground; use `--background` to run it as a background job.
@@ -98,6 +98,8 @@ Hands a task to NanoGPT through the `nano:nano-rescue` subagent. **This only eve
 - `--allow-bash <prefix>` — add a Bash prefix to the allowlist for this run (repeatable). The command then runs with any arguments; see [Permission Profiles](#permission-profiles) for the risk.
 - `--allow-paid` — allow a non-subscription (pay-per-token) model. Refused otherwise.
 - `--max-turns <n>` — cap the run at `n` turns (1-500, default 25). See [Turn Caps](#turn-caps) below.
+- `--prompt-file <path>` — read the task prompt from a UTF-8 file instead of the positional text (path relative to the command cwd; cannot be combined with a positional task).
+- `--out <path>` — write only the model's final result text (no header, footer, or warnings) to `<path>` after the run, relative to the command cwd. Parent directories are created and an existing file is overwritten. With `--background`, the worker writes the file on completion. If the run produced no result text, no file is written and a notice goes to stderr.
 
 Examples:
 
@@ -107,23 +109,30 @@ Examples:
 /nano:rescue --model heavy fix the issue
 /nano:rescue --continue apply the top fix from the last run
 /nano:rescue --read-only explore the authentication flow
+/nano:rescue --prompt-file notes/task.md --out reports/task.txt
 ```
 
 ### /nano:review
 
 ```
-/nano:review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-turns <n>]
+/nano:review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--exclude <glob>] [--max-turns <n>] [--out <path>]
 ```
 
 Runs a read-only NanoGPT review on your current uncommitted changes or your branch compared to a base ref. The NanoGPT model can read files but cannot edit them or run commands. It is not steerable and does not take focus text. Use `--base <ref>` for branch review. `--scope` defaults to `auto`. `--max-turns <n>` caps the review at `n` turns (default 15); reviews are read-only and rarely need more.
 
+`--exclude <glob>` (repeatable) keeps matching files out of the inline diff. A pattern without `/` matches at any depth (`*.snap`); one with `/` is relative to the repo root (`docs/**`). Lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `Cargo.lock`, and other common ones) are excluded by default at any depth, and binary files are never inlined — git prints a one-line "Binary files … differ" instead of a base85 payload. Excluded files still appear in the Git Status and Diff Stat sections, and an "Omitted from the inline diff" line lists them (up to 20 names).
+
+`--out <path>` writes only the model's final review text (no header, footer, or warnings) to `<path>` relative to the command cwd; parent directories are created and an existing file is overwritten. If the review produced no result text, no file is written and a notice goes to stderr.
+
+**Large diffs:** when the inline diff exceeds `NANO_REVIEW_INLINE_BYTES` (default 200000 bytes; set it to a positive integer to change), the diff is written to a private temporary file (`review.diff`, mode 0600) and the prompt points the model at its path instead of inlining it — Git Status, Commit Log, and Diff Stat stay inline. The model is granted Read access to that file's directory for the duration of the run, and the temporary directory is deleted afterwards. This keeps reviews of large branches working: claude refuses a stdin prompt over 10 MB.
+
 ### /nano:adversarial-review
 
 ```
-/nano:adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-turns <n>] [focus ...]
+/nano:adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--exclude <glob>] [--max-turns <n>] [--focus-file <path>] [--out <path>] [focus ...]
 ```
 
-Runs a steerable review that questions the chosen implementation, design tradeoffs, and assumptions. Like `/nano:review`, it is read-only: the NanoGPT model can read files but cannot edit them or run commands. It uses the same target selection as `/nano:review` and additionally accepts focus text after the flags. `--max-turns <n>` caps the review at `n` turns (default 15). Use it to pressure-test specific risk areas like auth, data loss, race conditions, or rollback.
+Runs a steerable review that questions the chosen implementation, design tradeoffs, and assumptions. Like `/nano:review`, it is read-only: the NanoGPT model can read files but cannot edit them or run commands. It uses the same target selection as `/nano:review` (including the `--exclude`, lockfile/binary exclusion, and large-diff spill behavior), and additionally accepts focus text after the flags or via `--focus-file <path>` (read from a UTF-8 file, path relative to the command cwd; the two cannot be combined). `--max-turns <n>` caps the review at `n` turns (default 15). Use it to pressure-test specific risk areas like auth, data loss, race conditions, or rollback. `--out <path>` works exactly as for `/nano:review`.
 
 ### /nano:setup
 

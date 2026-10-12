@@ -1,6 +1,6 @@
 ---
 description: Run a NanoGPT code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-turns <n>]'
+argument-hint: '[--wait|--background] [--base <ref>] [--exclude <glob>] [--out <path>] [--scope auto|working-tree|branch] [--max-turns <n>]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---

@@ -1,6 +1,6 @@
 ---
 description: Run a NanoGPT review that challenges the implementation approach and design choices
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-turns <n>] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--exclude <glob>] [--focus-file <path>] [--out <path>] [--scope auto|working-tree|branch] [--max-turns <n>] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---

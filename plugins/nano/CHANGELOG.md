@@ -4,6 +4,11 @@
 
 - Logging MCP proxy (`.mcp.json`, `scripts/nanogpt-mcp-proxy.mjs`) around `@nanogpt/mcp@1.5.0`, exposed as `mcp__plugin_nano_nanogpt__*`. It logs every tool call with latency, usage and cost to `mcp-calls.jsonl`, injects `include_usage` into `nanogpt_chat`, takes the API key from the keychain instead of plaintext config, and raises the upstream timeout to 300 s.
 - Generated and edited images are archived locally with a JSON sidecar holding the original prompt and arguments, and the tool result tells Claude where the files are.
+- A run whose `claude` exits without a result (for example a prompt over claude's 10 MB stdin limit) reports claude's exit status and stderr instead of crashing with `Cannot read properties of null (reading 'usage')`.
+- Review diffs no longer use `--binary` (a binary file is one "Binary files … differ" line), lockfiles are left out of the inline diff by default, and `--exclude <glob>` (repeatable) leaves out more. Omitted files are still in the diff stat and are listed.
+- A diff over `NANO_REVIEW_INLINE_BYTES` (default 200000) is written to a private temp file that the model reads via `--add-dir`, instead of being inlined. A prompt over 9 MB fails early with a clear message.
+- `task --prompt-file <path>`, `adversarial-review --focus-file <path>`, and `--out <path>` (writes only the model's final text, and only for a successful run).
+- Clearer error for `--read-only` combined with `--allow-bash`.
 
 ## 0.1.0
 

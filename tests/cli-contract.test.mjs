@@ -36,6 +36,8 @@ Options:
   --allowedTools, --allowed-tools <tools...>
       Comma or space-separated list of tool names to allow (e.g. "Bash(git *)
       Edit")
+  --add-dir <directories...>            Additional directories to allow tool
+                                        access to
   -h, --help                            Display help for command
   --model <model>                       Model for the current session.
   --output-format <format>              Output format (only works with --print):
@@ -75,6 +77,7 @@ Usage: claude [options] [command] [prompt]
 Options:
   ${C}--allowedTools${R}, ${C}--allowed-tools${R} <tools...>
       Comma or space-separated list of tool names to allow
+  ${C}--add-dir${R} <directories...>            Additional directories to allow tool access to
   ${C}-p${R}, ${C}--print${R}                       Print response and exit.
   ${C}--restricted${R}                          Restricted mode.
   ${C}--strict-mcp-config${R}                   Only use MCP servers from --mcp-config.
@@ -110,7 +113,8 @@ test("manifest covers exactly the claude surface the plugin uses", () => {
     "stream-json",
     "--verbose",
     "--resume",
-    "--model"
+    "--model",
+    "--add-dir"
   ]) {
     assert.ok(tokens.includes(expected), `manifest must require ${expected}`);
   }

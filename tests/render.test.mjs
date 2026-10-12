@@ -1,7 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderNoResultBody, renderReviewResult, renderStoredJobResult, renderTaskRun } from "../plugins/nano/scripts/lib/render.mjs";
+import {
+  buildNoResultError,
+  renderNoResultBody,
+  renderReviewResult,
+  renderRunFooter,
+  renderStoredJobResult,
+  renderTaskRun
+} from "../plugins/nano/scripts/lib/render.mjs";
 
 test("renderReviewResult renders the result text under a NanoGPT review header, with a footer", () => {
   const output = renderReviewResult({
@@ -68,6 +75,48 @@ test("renderReviewResult falls back to renderNoResultBody (no footer) when there
   assert.match(output, /NanoGPT did not return a result\./);
   assert.match(output, /```text\nboom\n```/);
   assert.doesNotMatch(output, /\[nano\]/);
+});
+
+test("renderReviewResult names claude's exit status and stderr when there is no summary", () => {
+  const output = renderReviewResult({
+    reviewLabel: "Review",
+    targetLabel: "branch diff against main",
+    summary: null,
+    model: "m",
+    stderr: "Error: piped stdin input exceeds 10MB. Pass large content as a file path in your prompt instead.",
+    exitStatus: 1
+  });
+
+  assert.match(output, /NanoGPT did not return a result\./);
+  assert.match(output, /claude exited with status 1 before returning a result/);
+  assert.match(output, /piped stdin input exceeds 10MB/);
+});
+
+test("renderRunFooter never throws when summary is null", () => {
+  const footer = renderRunFooter({ model: "z-ai/glm-5.2", summary: null, quota: null });
+  assert.equal(footer, "[nano] model=z-ai/glm-5.2 turns=? tokens=0in/0out secs=0 session=none");
+});
+
+test("buildNoResultError returns the status line alone when stderr is empty", () => {
+  assert.equal(buildNoResultError(1, ""), "claude exited with status 1 before returning a result");
+});
+
+test("buildNoResultError keeps only the first 20 stderr lines", () => {
+  const stderr = Array.from({ length: 30 }, (_, index) => `line-${index}`).join("\n");
+  const message = buildNoResultError(2, stderr);
+  assert.match(message, /claude exited with status 2 before returning a result/);
+  assert.match(message, /line-0\n/);
+  assert.match(message, /line-19$/);
+  assert.equal(message.includes("line-20"), false);
+});
+
+test("renderNoResultBody keeps only the first 20 stderr lines", () => {
+  const stderr = Array.from({ length: 25 }, (_, index) => `err-${index}`).join("\n");
+  const body = renderNoResultBody({ stderr, exitStatus: 1 });
+  assert.match(body, /err-0\n/);
+  assert.match(body, /err-19\n/);
+  assert.equal(body.includes("err-20"), false);
+  assert.equal(body.includes("err-24"), false);
 });
 
 test("renderNoResultBody prefers stderr over stdout and omits the code block when both are empty", () => {

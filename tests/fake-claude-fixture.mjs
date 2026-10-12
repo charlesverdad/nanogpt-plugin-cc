@@ -32,6 +32,10 @@ export const FAKE_API_KEY = "nano-test-key-DO-NOT-LEAK-7f3a";
  *   - "crash-after-init"  stream-json: print the init and one assistant
  *                 tool_use line, then exit 1 with NO result object (json:
  *                 print nothing, exit 1). Simulates claude dying mid-run.
+ *   - "no-result-error"  write nothing to stdout, write
+ *                 options.stderrText (default: real claude's 10 MB stdin
+ *                 refusal) to stderr, exit 1. Simulates claude refusing the
+ *                 prompt before returning any result.
  *
  * Each run-mode invocation appends ONE JSON line to
  * `<binDir>/claude-invocations.log` recording the argv it received and decoded
@@ -42,11 +46,15 @@ export const FAKE_API_KEY = "nano-test-key-DO-NOT-LEAK-7f3a";
  * `options.version` (default "2.1.278") overrides the --version string.
  * `options.resultText` overrides the "ok" result text.
  * `options.delayMs` (default 5000) is used by behavior "slow".
+ * `options.stderrText` overrides the stderr written by behavior
+ * "no-result-error".
  */
 export function installFakeClaude(binDir, behavior = "ok", options = {}) {
   const version = options.version ?? "2.1.278";
   const resultText = options.resultText ?? null;
   const delayMs = options.delayMs ?? 5000;
+  const stderrText =
+    options.stderrText ?? "Error: piped stdin input exceeds 10MB. Pass large content as a file path in your prompt instead.";
   const invocationsLog = path.join(binDir, "claude-invocations.log");
   const scriptPath = path.join(binDir, "claude");
   const source = `#!/usr/bin/env node
@@ -56,6 +64,7 @@ const BEHAVIOR = ${JSON.stringify(behavior)};
 const VERSION = ${JSON.stringify(version)};
 const RESULT_TEXT = ${JSON.stringify(resultText)};
 const DELAY_MS = ${JSON.stringify(delayMs)};
+const STDERR_TEXT = ${JSON.stringify(stderrText)};
 const INVOCATIONS_LOG = ${JSON.stringify(invocationsLog)};
 
 const argv = process.argv.slice(2);
@@ -110,6 +119,7 @@ if (argv[0] === "--help" || argv[0] === "-h") {
     "  --verbose                        verbose output",
     "  -r, --resume [value]             resume a session",
     "  --model <model>                  model to use",
+    "  --add-dir <directories...>       additional directories to allow tool access to",
     "  -v, --version                    print version",
     "",
     "Commands:",
@@ -138,7 +148,8 @@ function parseRunArgs(args) {
     restricted: false,
     strictMcpConfig: false,
     print: false,
-    prompt: null
+    prompt: null,
+    addDirs: []
   };
   let sawDashDash = false;
   for (let i = 0; i < args.length; i += 1) {
@@ -197,6 +208,8 @@ function parseRunArgs(args) {
       i += 1;
     } else if (token.startsWith("--max-turns=")) {
       parsed.maxTurns = token.slice("--max-turns=".length);
+    } else if (token.startsWith("--add-dir=")) {
+      parsed.addDirs.push(token.slice("--add-dir=".length));
     }
   }
   if (parsed.prompt === null && !sawDashDash) {
@@ -268,6 +281,7 @@ function recordInvocation() {
     verbose: run.verbose,
     resume: run.resume,
     maxTurns: run.maxTurns,
+    addDirs: run.addDirs,
     restricted: run.restricted,
     strictMcpConfig: run.strictMcpConfig,
     envNames: envNames,
@@ -411,7 +425,11 @@ function finish() {
   process.exit(exitCode);
 }
 
-if (BEHAVIOR === "crash-after-init") {
+if (BEHAVIOR === "no-result-error") {
+  recordInvocation();
+  process.stderr.write(STDERR_TEXT + "\\n");
+  process.exit(1);
+} else if (BEHAVIOR === "crash-after-init") {
   recordInvocation();
   if (run.outputFormat === "stream-json") {
     process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: run.model, cwd: process.cwd() }) + "\\n");

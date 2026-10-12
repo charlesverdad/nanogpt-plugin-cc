@@ -265,6 +265,126 @@ test("review exits non-zero and prefixes the failed body when the run fails", ()
   assert.match(payload.text, /API Error: simulated failure/);
 });
 
+// --- review: no result / spill / binary / lockfile / --exclude (A1, A3) ----
+
+test("review surfaces claude's stderr instead of crashing when claude returns no result", () => {
+  const rt = setupRuntime("no-result-error");
+  commitInitial(rt.repoDir);
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const x = 1;\n", "utf8");
+
+  const result = runCompanion(rt, ["review", "--json", "--scope", "working-tree"]);
+
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout.includes("Cannot read properties"), false, "must not crash on a null summary");
+  assert.equal(result.stderr.includes("Cannot read properties"), false, "must not crash on a null summary");
+  const payload = JSON.parse(result.stdout);
+  assert.match(payload.error, /claude exited with status 1 before returning a result/);
+  assert.match(payload.error, /piped stdin input exceeds 10MB/);
+  // The noise line is filtered out of the surfaced stderr.
+  assert.equal(result.stdout.includes("unrecognized_model"), false);
+});
+
+test("adversarial-review surfaces claude's stderr instead of crashing when claude returns no result", () => {
+  const rt = setupRuntime("no-result-error");
+  commitInitial(rt.repoDir);
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const x = 1;\n", "utf8");
+
+  const result = runCompanion(rt, ["adversarial-review", "--json", "--scope", "working-tree", "check auth"]);
+
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout.includes("Cannot read properties"), false, "must not crash on a null summary");
+  const payload = JSON.parse(result.stdout);
+  assert.match(payload.error, /piped stdin input exceeds 10MB/);
+});
+
+test("a review diff larger than the inline budget is spilled to a file and claude gets --add-dir", () => {
+  const rt = setupRuntime("ok");
+  commitInitial(rt.repoDir);
+  run("git", ["checkout", "-b", "feature/spill"], { cwd: rt.repoDir });
+  fs.writeFileSync(path.join(rt.repoDir, "big.txt"), `${"x".repeat(500_000)}\n`, "utf8");
+  run("git", ["add", "."], { cwd: rt.repoDir });
+  run("git", ["commit", "-m", "big"], { cwd: rt.repoDir });
+
+  const env = { ...rt.env, NANO_REVIEW_INLINE_BYTES: "2000" };
+  const result = runCompanion(rt, ["review", "--json", "--base", "main"], { env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  // The prompt points at the spill file instead of inlining the diff body.
+  assert.match(invocations[0].prompt, /too large to inline/);
+  assert.match(invocations[0].prompt, /nano-review-/);
+  assert.equal(
+    invocations[0].prompt.includes("x".repeat(100)),
+    false,
+    "the diff body must not be inlined"
+  );
+  // claude is granted Read access to the spill directory under --restricted.
+  assert.ok(invocations[0].addDirs.length >= 1, "expected at least one --add-dir");
+  assert.match(invocations[0].addDirs[0], /nano-review-/);
+  // The spill directory is cleaned up after the run.
+  assert.equal(fs.existsSync(invocations[0].addDirs[0]), false, "spill dir should be gone");
+});
+
+test("a committed binary file diffs as 'Binary files ... differ' with no base85 GIT binary patch", () => {
+  const rt = setupRuntime("ok");
+  commitInitial(rt.repoDir);
+  run("git", ["checkout", "-b", "feature/png"], { cwd: rt.repoDir });
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(512, 0)]);
+  fs.writeFileSync(path.join(rt.repoDir, "snapshot.png"), png);
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const b = 1;\n", "utf8");
+  run("git", ["add", "."], { cwd: rt.repoDir });
+  run("git", ["commit", "-m", "add png"], { cwd: rt.repoDir });
+
+  const result = runCompanion(rt, ["review", "--json", "--base", "main"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.match(invocations[0].prompt, /Binary files \S* and b\/snapshot\.png differ/);
+  assert.equal(invocations[0].prompt.includes("GIT binary patch"), false, "no base85 payload");
+});
+
+test("a lockfile change is omitted from the inline review diff but listed in Diff Stat and the Omitted line", () => {
+  const rt = setupRuntime("ok");
+  commitInitial(rt.repoDir);
+  run("git", ["checkout", "-b", "feature/lock"], { cwd: rt.repoDir });
+  fs.writeFileSync(path.join(rt.repoDir, "pnpm-lock.yaml"), "lockfileVersion: 9.0\n".repeat(40));
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const l = 1;\n", "utf8");
+  run("git", ["add", "."], { cwd: rt.repoDir });
+  run("git", ["commit", "-m", "lockfile"], { cwd: rt.repoDir });
+
+  const result = runCompanion(rt, ["review", "--json", "--base", "main"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(
+    invocations[0].prompt.includes("lockfileVersion: 9.0"),
+    false,
+    "lockfile body must not be inlined"
+  );
+  assert.match(invocations[0].prompt, /pnpm-lock\.yaml/);
+  assert.match(invocations[0].prompt, /Omitted from the inline diff: 1 file\(s\)/);
+});
+
+test("review --exclude excludes matching files from the inline diff", () => {
+  const rt = setupRuntime("ok");
+  commitInitial(rt.repoDir);
+  run("git", ["checkout", "-b", "feature/docs"], { cwd: rt.repoDir });
+  fs.mkdirSync(path.join(rt.repoDir, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(rt.repoDir, "docs", "keep.md"), "KEEP_ME\n", "utf8");
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const e = 1;\n", "utf8");
+  run("git", ["add", "."], { cwd: rt.repoDir });
+  run("git", ["commit", "-m", "docs"], { cwd: rt.repoDir });
+
+  const result = runCompanion(rt, ["review", "--json", "--base", "main", "--exclude", "docs/**"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations[0].prompt.includes("KEEP_ME"), false, "docs/** must exclude docs/keep.md");
+  assert.match(invocations[0].prompt, /\+export const e = 1;/);
+  assert.match(invocations[0].prompt, /Omitted from the inline diff: 1 file\(s\)[^\n]*docs\/keep\.md/);
+});
+
 // --- task: permission profiles ----------------------------------------------
 
 test("task with no flags runs the write profile with the default Bash allowlist", () => {
@@ -308,12 +428,14 @@ test("--allow-bash extends the write profile's Bash allowlist", () => {
   assert.match(invocations[0].allowedTools, /Bash\(git status:\*\)/);
 });
 
-test("--read-only combined with --allow-bash is an error", () => {
+test("--read-only combined with --allow-bash is an error that points at the alternatives", () => {
   const rt = setupRuntime("ok");
   const result = runCompanion(rt, ["task", "--read-only", "--allow-bash", "npm test", "Do a thing"]);
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /--read-only.*--allow-bash/);
+  assert.match(result.stderr, /--read-only.*--allow-bash/s);
+  assert.match(result.stderr, /runs have no Bash/);
+  assert.match(result.stderr, /review`\/`adversarial-review --base <ref>/);
 });
 
 test("config.bashAllow prefixes are included in the write profile's allowedTools", () => {
@@ -351,6 +473,135 @@ test("task reads the prompt from piped stdin", () => {
   const invocations = readInvocations(rt.invocationsLog);
   assert.equal(invocations.length, 1);
   assert.match(invocations[0].prompt, /Prompt via stdin/);
+});
+
+// --- task / review: --prompt-file, --focus-file, --out (A4, A5) --------------
+
+test("task --prompt-file reads the prompt from a file relative to the command cwd", () => {
+  const rt = setupRuntime("ok");
+  const subDir = path.join(rt.repoDir, "sub");
+  fs.mkdirSync(subDir, { recursive: true });
+  fs.writeFileSync(path.join(subDir, "prompt.txt"), "Prompt from a file.\n", "utf8");
+
+  // The path is relative to the invocation cwd (the repo root), not the task cwd.
+  const result = runCompanion(rt, ["task", "--json", "--prompt-file", "sub/prompt.txt"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.match(invocations[0].prompt, /^Prompt from a file\./);
+});
+
+test("task --prompt-file combined with a positional prompt is an error", () => {
+  const rt = setupRuntime("ok");
+  fs.writeFileSync(path.join(rt.repoDir, "prompt.txt"), "From file\n", "utf8");
+
+  const result = runCompanion(rt, ["task", "--prompt-file", "prompt.txt", "and positional"]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /either --prompt-file <path> or a positional prompt, not both/);
+  assert.equal(readInvocations(rt.invocationsLog).length, 0, "claude must never be invoked");
+});
+
+test("task --prompt-file --background stores the prompt text, not the path", () => {
+  const rt = setupRuntime("ok");
+  fs.writeFileSync(path.join(rt.repoDir, "prompt.txt"), "Background prompt from file.\n", "utf8");
+
+  const launch = runCompanion(rt, ["task", "--json", "--background", "--prompt-file", "prompt.txt"]);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const waited = runCompanion(rt, ["status", jobId, "--wait", "--json", "--timeout-ms", "20000", "--poll-interval-ms", "200"]);
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.equal(invocations.length, 1);
+  assert.match(invocations[0].prompt, /^Background prompt from file\./);
+});
+
+test("adversarial-review --focus-file reads the focus text from a file", () => {
+  const rt = setupRuntime("ok");
+  commitInitial(rt.repoDir);
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const f = 1;\n", "utf8");
+  fs.writeFileSync(path.join(rt.repoDir, "focus.txt"), "Focus on auth boundaries.\n", "utf8");
+
+  const result = runCompanion(rt, ["adversarial-review", "--json", "--scope", "working-tree", "--focus-file", "focus.txt"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  const invocations = readInvocations(rt.invocationsLog);
+  assert.match(invocations[0].prompt, /Focus on auth boundaries\./);
+});
+
+test("adversarial-review --focus-file combined with positional focus is an error", () => {
+  const rt = setupRuntime("ok");
+  commitInitial(rt.repoDir);
+  fs.writeFileSync(path.join(rt.repoDir, "focus.txt"), "From file\n", "utf8");
+
+  const result = runCompanion(rt, ["adversarial-review", "--focus-file", "focus.txt", "and positional"]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /either --focus-file <path> or positional focus text, not both/);
+  assert.equal(readInvocations(rt.invocationsLog).length, 0, "claude must never be invoked");
+});
+
+test("review rejects --focus-file", () => {
+  const rt = setupRuntime("ok");
+  commitInitial(rt.repoDir);
+
+  const result = runCompanion(rt, ["review", "--focus-file", "focus.txt"]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /review` does not support --focus-file/);
+  assert.equal(readInvocations(rt.invocationsLog).length, 0, "claude must never be invoked");
+});
+
+test("--out writes only the result text, relative to the command cwd, creating parent dirs", () => {
+  const rt = setupRuntime("ok", { resultText: "The clean report body.\nSecond line.\n" });
+  commitInitial(rt.repoDir);
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const o = 1;\n", "utf8");
+
+  const outPath = path.join(rt.repoDir, "reports", "nested", "review.txt");
+  const result = runCompanion(rt, ["review", "--json", "--scope", "working-tree", "--out", "reports/nested/review.txt"]);
+
+  assert.equal(result.status, 0, result.stderr);
+  // stdout is unchanged: --json payload only, no report body leaked into it.
+  const payload = JSON.parse(result.stdout);
+  assert.match(payload.text, /The clean report body\./);
+  assert.equal(fs.readFileSync(outPath, "utf8"), "The clean report body.\nSecond line.\n");
+
+  const taskOut = path.join(rt.repoDir, "reports", "task.txt");
+  const task = runCompanion(rt, ["task", "--json", "--out", "reports/task.txt", "Do a thing"]);
+  assert.equal(task.status, 0, task.stderr);
+  assert.equal(fs.readFileSync(taskOut, "utf8"), "The clean report body.\nSecond line.\n");
+});
+
+test("--out with no result text prints a stderr notice and writes no file", () => {
+  const rt = setupRuntime("no-result-error");
+  commitInitial(rt.repoDir);
+  fs.writeFileSync(path.join(rt.repoDir, "app.js"), "export const n = 1;\n", "utf8");
+
+  const outPath = path.join(rt.repoDir, "reports", "review.txt");
+  const result = runCompanion(rt, ["review", "--json", "--scope", "working-tree", "--out", "reports/review.txt"]);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /\[nano\] no result text; --out file not written/);
+  assert.equal(fs.existsSync(outPath), false, "the --out file must not be created");
+});
+
+test("task --background --out writes the result file when the worker completes", () => {
+  const rt = setupRuntime("ok", { resultText: "Background report body.\n" });
+  const outPath = path.join(rt.repoDir, "reports", "bg.txt");
+
+  const launch = runCompanion(rt, ["task", "--json", "--background", "--out", "reports/bg.txt", "Do a thing"]);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId } = JSON.parse(launch.stdout);
+
+  const waited = runCompanion(rt, ["status", jobId, "--wait", "--json", "--timeout-ms", "20000", "--poll-interval-ms", "200"]);
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  assert.equal(fs.existsSync(outPath), true, "worker must write the --out file");
+  assert.equal(fs.readFileSync(outPath, "utf8"), "Background report body.\n");
 });
 
 test("task forwards --model (and -m alias) to the claude invocation", () => {
@@ -450,6 +701,7 @@ test("task --json payload has the documented shape", () => {
       "status",
       "isError",
       "rawOutput",
+      "error",
       "claudeSessionId",
       "model",
       "profile",

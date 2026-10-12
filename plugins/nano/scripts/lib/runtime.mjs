@@ -27,6 +27,20 @@ export const DEFAULT_TASK_MAX_TURNS = 25;
 export const DEFAULT_REVIEW_MAX_TURNS = 15;
 export const MAX_TURNS_LIMIT = 500;
 
+// Above this many UTF-8 bytes, a review's inline diff is spilled to a file
+// (review.diff in a private temp dir) and the prompt points claude at it
+// instead of inlining the whole diff. Real `claude` refuses stdin prompts
+// larger than 10 MB, and a branch with committed PNGs/base85 lockfiles can
+// easily reach that, so the default is far below the hard limit. Overridable
+// with NANO_REVIEW_INLINE_BYTES (positive integer; invalid values are
+// ignored).
+export const DEFAULT_REVIEW_INLINE_BYTES = 200_000;
+
+// Hard ceiling before spawning: real claude exits 1 with "piped stdin input
+// exceeds 10MB" on a stdin prompt over 10 MB. We refuse a little below that so
+// the error message is ours, not claude's.
+export const MAX_PROMPT_BYTES = 9_000_000;
+
 // Host settings that would route the child to a different provider or a paid
 // Claude model. They are removed before ours are applied.
 export const STRIPPED_ENV_VARS = Object.freeze([
@@ -235,6 +249,13 @@ export function isMaxTurnsStop(summary) {
  * the child's stdin instead (for prompts too large for a single argv entry).
  * `maxTurns` (null = no cap flag) adds `--max-turns <n>` right after
  * `--strict-mcp-config`.
+ *
+ * `addDirs` appends `--add-dir=<dir>` for each entry (always the `=` form:
+ * `--add-dir` is variadic and would otherwise swallow the prompt). The child
+ * runs under `--restricted`, which denies Read outside the working directory;
+ * `--add-dir` grants read access to exactly that directory, used to let claude
+ * read a spilled review diff. Non-absolute paths and paths containing newlines
+ * or commas are rejected.
  */
 export function buildClaudeArgs({
   prompt,
@@ -244,7 +265,8 @@ export function buildClaudeArgs({
   resumeSessionId = null,
   outputFormat = "json",
   promptViaStdin = false,
-  maxTurns = null
+  maxTurns = null,
+  addDirs = []
 } = {}) {
   if (!model) {
     throw new Error("buildClaudeArgs requires a model.");
@@ -277,6 +299,15 @@ export function buildClaudeArgs({
   }
   if (resumeSessionId) {
     args.push("--resume", String(resumeSessionId));
+  }
+  for (const dir of addDirs) {
+    if (typeof dir !== "string" || !path.isAbsolute(dir)) {
+      throw new Error(`--add-dir requires an absolute path: ${JSON.stringify(dir)}.`);
+    }
+    if (dir.includes("\n") || dir.includes(",")) {
+      throw new Error(`--add-dir path must not contain newlines or commas: ${JSON.stringify(dir)}.`);
+    }
+    args.push(`--add-dir=${dir}`);
   }
   if (!promptViaStdin) {
     args.push("--", prompt);
@@ -311,6 +342,23 @@ export function resolveMaxInlineChars(env = process.env) {
     return value;
   }
   return DEFAULT_MAX_INLINE_CHARS;
+}
+
+/**
+ * Byte budget for inlining a review diff (overridable via
+ * NANO_REVIEW_INLINE_BYTES). Only a whole positive integer counts; anything
+ * else (0, negative, fractional, non-numeric) is ignored so a typo never
+ * disables the spill-to-file behaviour.
+ */
+export function resolveReviewInlineBytes(env = process.env) {
+  const raw = String(env.NANO_REVIEW_INLINE_BYTES ?? "").trim();
+  if (/^\d+$/.test(raw)) {
+    const value = Number(raw);
+    if (value > 0) {
+      return value;
+    }
+  }
+  return DEFAULT_REVIEW_INLINE_BYTES;
 }
 
 // ---------------------------------------------------------------------------

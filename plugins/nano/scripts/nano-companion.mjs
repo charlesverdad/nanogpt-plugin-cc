@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -23,8 +24,10 @@ import {
 import { verifyContract, HELP_ENV, REQUIRED_COMMANDS } from "./lib/cli-contract.mjs";
 import { runCommand } from "./lib/process.mjs";
 import {
+  buildSpilledContent,
   collectReviewContext,
   ensureGitRepository,
+  normalizeExcludes,
   resolveReviewTarget
 } from "./lib/git.mjs";
 import {
@@ -49,6 +52,7 @@ import {
   isMaxTurnsStop,
   isToolUseProgressLine,
   KEY_SETUP_COMMAND,
+  MAX_PROMPT_BYTES,
   MIN_CLAUDE_VERSION,
   normalizeBashAllow,
   normalizeMaxTurns,
@@ -59,6 +63,7 @@ import {
   resolveApiKey,
   resolveBaseUrl,
   resolveMaxInlineChars,
+  resolveReviewInlineBytes,
   runClaude,
   shouldSendPromptViaStdin,
   summarizeClaudeResult
@@ -93,7 +98,8 @@ import {
   renderStatusReport,
   renderStoredJobResult,
   renderTaskRun,
-  maxTurnsStopMessage
+  maxTurnsStopMessage,
+  buildNoResultError
 } from "./lib/render.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -139,9 +145,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/nano-companion.mjs setup [--json]",
-      "  node scripts/nano-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--max-turns <n>]",
-      "  node scripts/nano-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--max-turns <n>] [focus text]",
-      "  node scripts/nano-companion.mjs task [--background] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [prompt]",
+      "  node scripts/nano-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--exclude <glob>] [--model <model>] [--max-turns <n>] [--out <path>]",
+      "  node scripts/nano-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--exclude <glob>] [--model <model>] [--max-turns <n>] [--focus-file <path>] [--out <path>] [focus text]",
+      "  node scripts/nano-companion.mjs task [--background] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [--prompt-file <path>] [--out <path>] [prompt]",
       "  node scripts/nano-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/nano-companion.mjs result [job-id] [--json]",
       "  node scripts/nano-companion.mjs cancel [job-id] [--json]"
@@ -211,6 +217,42 @@ function firstMeaningfulLine(text, fallback) {
     .map((value) => value.trim())
     .find(Boolean);
   return line ?? fallback;
+}
+
+/**
+ * Write only the model's final result text (no header, footer, or warnings)
+ * to `outPath` (absolute). Parent dirs are created. When there is no result
+ * text (claude returned nothing), the file is not written and a notice goes to
+ * stderr so the caller knows. stdout output is left untouched.
+ */
+function writeResultOutFile(outPath, text) {
+  const body = String(text ?? "");
+  if (!body.trim()) {
+    // A missing file signals failure to the caller, so an error run never
+    // writes one.
+    process.stderr.write("[nano] no result text; --out file not written\n");
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, body.endsWith("\n") ? body : `${body}\n`);
+  } catch (error) {
+    process.stderr.write(`[nano] could not write --out file ${outPath}: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
+/**
+ * Read a UTF-8 file for a `--prompt-file`/`--focus-file` style option. The
+ * path is relative to the command cwd. A read failure is a hard error (exit
+ * 1) so the caller does not silently run with an empty prompt.
+ */
+function readTextOptionFile(cwd, filePath, flagName) {
+  const abs = path.resolve(cwd, filePath);
+  try {
+    return fs.readFileSync(abs, "utf8");
+  } catch (error) {
+    throw new Error(`Could not read ${flagName} file ${abs}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -542,11 +584,16 @@ async function handleSetup(argv) {
 
 /**
  * request = { cwd, prompt, model, profile ("read"|"write"), bashAllow,
- *   resumeSessionId, streaming, onProgress, onSession, maxTurns }
+ *   resumeSessionId, streaming, onProgress, onSession, maxTurns, addDirs }
  *
  * The permission profile is always rebuilt here from its name and the Bash
  * allowlist (validated by normalizeBashAllow); a ready-made tools/allowedTools
  * object, e.g. from a tampered job file, is rejected.
+ *
+ * `addDirs` appends `--add-dir=<dir>` for each entry, granting the restricted
+ * child read access outside the working directory. Reviews use it to let
+ * claude read a diff that was too large to inline and was spilled to a temp
+ * file.
  *
  * The API key is resolved fresh here (never taken from `request`), so a
  * queued background job's stored request never contains it. Returns
@@ -574,8 +621,9 @@ async function executeClaudeRun({
   streaming = false,
   onProgress = null,
   onSession = null,
-  maxTurns = null
-}) {
+  maxTurns = null,
+  addDirs = []
+} = {}) {
   if (typeof profile !== "string") {
     throw new Error('Invalid permission profile: expected "read" or "write".');
   }
@@ -595,7 +643,8 @@ async function executeClaudeRun({
     resumeSessionId,
     outputFormat: streaming ? "stream-json" : "json",
     promptViaStdin,
-    maxTurns
+    maxTurns,
+    addDirs
   });
 
   if (typeof onProgress === "function") {
@@ -712,67 +761,119 @@ async function executeReviewRun(request) {
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
+  const excludes = normalizeExcludes(request.excludes ?? []);
 
-  const context = collectReviewContext(request.cwd, target);
-  const prompt = buildReviewPrompt(context, focusText, reviewName === "Adversarial Review");
+  const context = collectReviewContext(request.cwd, target, { excludes });
 
-  const run = await executeClaudeRun({
-    cwd: request.cwd,
-    prompt,
-    model: request.model,
-    profile: "read",
-    maxTurns: request.maxTurns ?? null,
-    onProgress: request.onProgress
-  });
+  // If the inline diff is too large, spill it to a private temp file and point
+  // claude at it instead of inlining the whole diff (real claude refuses a
+  // stdin prompt over 10 MB). Git Status / Commit Log / Diff Stat stay inline.
+  const inlineBudget = resolveReviewInlineBytes();
+  let content = context.content;
+  let addDirs = [];
+  let spillDir = null;
+  if (context.inlineDiffBytes > inlineBudget) {
+    spillDir = fs.mkdtempSync(path.join(os.tmpdir(), "nano-review-"));
+    fs.chmodSync(spillDir, 0o700);
+    const spillPath = path.join(spillDir, "review.diff");
+    fs.writeFileSync(spillPath, context.inlineDiffText, { mode: 0o600 });
+    const spillLines = context.inlineDiffText.split("\n").length;
+    content = buildSpilledContent(context.sections, spillPath, context.inlineDiffBytes, spillLines);
+    addDirs = [spillDir];
+  }
 
-  const maxTurns = request.maxTurns ?? null;
-  const stoppedAtMaxTurns = isMaxTurnsStop(run.summary);
-  const warnings = Array.isArray(request.warnings) ? request.warnings : [];
-  const rendered = renderReviewResult({
-    reviewLabel: reviewName,
-    targetLabel: context.target.label,
-    summary: run.summary,
-    model: run.model,
-    stdout: run.stdout,
-    stderr: run.stderr,
-    warnings,
-    quota: run.quota,
-    maxTurns
-  });
+  const prompt = buildReviewPrompt({ ...context, content }, focusText, reviewName === "Adversarial Review");
 
-  const payload = {
-    review: reviewName,
-    target,
-    status: run.exitStatus,
-    isError: run.summary ? run.summary.isError : true,
-    text: run.summary ? run.summary.text : "",
-    claudeSessionId: run.summary?.sessionId ?? null,
-    model: run.model,
-    usage: run.summary?.usage ?? {},
-    permissionDenials: run.summary?.permissionDenials ?? [],
-    numTurns: run.summary?.numTurns ?? null,
-    durationMs: run.summary?.durationMs ?? null,
-    quota: run.quota ?? null,
-    stopReason: stoppedAtMaxTurns ? "max_turns" : null,
-    maxTurns,
-    stderr: run.stderr,
-    warnings,
-    footer: renderRunFooter({ model: run.model, summary: run.summary, quota: run.quota })
-  };
+  // Hard ceiling before spawning: even after spilling the diff, a huge focus
+  // text or commit log could still exceed claude's 10 MB stdin limit. Fail
+  // with our own message rather than letting claude exit 1 with an empty
+  // result.
+  const promptBytes = Buffer.byteLength(prompt, "utf8");
+  if (promptBytes > MAX_PROMPT_BYTES) {
+    throw new Error(
+      `Prompt is ${promptBytes} bytes; claude accepts at most 10 MB on stdin. Narrow the review with --exclude or --base.`
+    );
+  }
 
-  return {
-    exitStatus: run.exitStatus,
-    payload,
-    rendered,
-    summary: stoppedAtMaxTurns
-      ? maxTurnsStopMessage(maxTurns, { canContinue: false })
-      : run.summary
-        ? firstMeaningfulLine(run.summary.text, `${reviewName} completed.`)
-        : firstMeaningfulLine(run.stderr || run.stdout, `${reviewName} did not return a result.`),
-    jobTitle: `NanoGPT ${reviewName}`,
-    jobClass: "review",
-    targetLabel: target.label
-  };
+  try {
+    const run = await executeClaudeRun({
+      cwd: request.cwd,
+      prompt,
+      model: request.model,
+      profile: "read",
+      maxTurns: request.maxTurns ?? null,
+      onProgress: request.onProgress,
+      addDirs
+    });
+
+    const maxTurns = request.maxTurns ?? null;
+    const stoppedAtMaxTurns = isMaxTurnsStop(run.summary);
+    const warnings = Array.isArray(request.warnings) ? request.warnings : [];
+    // When claude printed no result object, surface its real stderr (first 20
+    // lines) instead of crashing on a null summary.
+    const noResultError = run.summary ? null : buildNoResultError(run.exitStatus, run.stderr);
+    const rendered = renderReviewResult({
+      reviewLabel: reviewName,
+      targetLabel: context.target.label,
+      summary: run.summary,
+      model: run.model,
+      stdout: run.stdout,
+      stderr: run.stderr,
+      warnings,
+      quota: run.quota,
+      maxTurns,
+      exitStatus: run.summary ? null : run.exitStatus
+    });
+
+    const payload = {
+      review: reviewName,
+      target,
+      status: run.exitStatus,
+      isError: run.summary ? run.summary.isError : true,
+      text: run.summary ? run.summary.text : "",
+      error: noResultError,
+      claudeSessionId: run.summary?.sessionId ?? null,
+      model: run.model,
+      usage: run.summary?.usage ?? {},
+      permissionDenials: run.summary?.permissionDenials ?? [],
+      numTurns: run.summary?.numTurns ?? null,
+      durationMs: run.summary?.durationMs ?? null,
+      quota: run.quota ?? null,
+      stopReason: stoppedAtMaxTurns ? "max_turns" : null,
+      maxTurns,
+      stderr: run.stderr,
+      warnings,
+      footer: renderRunFooter({ model: run.model, summary: run.summary, quota: run.quota })
+    };
+
+    // --out: write only the model's final result text (no header/footer/
+    // warnings) to a file, relative to the command cwd.
+    if (request.outPath) {
+      writeResultOutFile(request.outPath, run.summary && !run.summary.isError ? run.summary.text : "");
+    }
+
+    return {
+      exitStatus: run.exitStatus,
+      payload,
+      rendered,
+      summary: stoppedAtMaxTurns
+        ? maxTurnsStopMessage(maxTurns, { canContinue: false })
+        : run.summary
+          ? firstMeaningfulLine(run.summary.text, `${reviewName} completed.`)
+          : noResultError,
+      jobTitle: `NanoGPT ${reviewName}`,
+      jobClass: "review",
+      targetLabel: target.label
+    };
+  } finally {
+    if (spillDir) {
+      try {
+        fs.rmSync(spillDir, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup of the spill directory
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +901,9 @@ async function executeTaskRun(request) {
 
   const stoppedAtMaxTurns = isMaxTurnsStop(run.summary);
   const warnings = Array.isArray(request.warnings) ? request.warnings : [];
+  // When claude printed no result object, surface its real stderr (first 20
+  // lines) instead of crashing on a null summary.
+  const noResultError = run.summary ? null : buildNoResultError(run.exitStatus, run.stderr);
   const { rendered, footer } = renderTaskRun({
     summary: run.summary,
     model: run.model,
@@ -809,13 +913,15 @@ async function executeTaskRun(request) {
     stderr: run.stderr,
     warnings,
     quota: run.quota,
-    maxTurns
+    maxTurns,
+    exitStatus: run.summary ? null : run.exitStatus
   });
 
   const payload = {
     status: run.exitStatus,
     isError: run.summary ? run.summary.isError : true,
     rawOutput: run.summary ? run.summary.text : "",
+    error: noResultError,
     // A run that died after its stream reported a session (no result object)
     // is still resumable; keep that id rather than null.
     claudeSessionId: run.summary?.sessionId ?? run.streamSessionId ?? null,
@@ -834,11 +940,18 @@ async function executeTaskRun(request) {
     footer
   };
 
+  // --out for background tasks: the worker stores outPath in the request, so
+  // write the result text on completion. Foreground tasks write --out in the
+  // handler (the path is not part of the request there).
+  if (request.outPath) {
+    writeResultOutFile(request.outPath, run.summary && !run.summary.isError ? run.summary.text : "");
+  }
+
   const summary = stoppedAtMaxTurns
     ? maxTurnsStopMessage(maxTurns, { canContinue: true })
     : run.summary
       ? firstMeaningfulLine(run.summary.text, run.summary.isError ? "NanoGPT run failed." : "Task finished.")
-      : firstMeaningfulLine(run.stderr || run.stdout, "NanoGPT did not return a result.");
+      : noResultError;
 
   return {
     exitStatus: run.exitStatus,
@@ -924,7 +1037,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, origin = null) {
   return origin ? { ...job, origin } : job;
 }
 
-function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId, warnings, maxTurns }) {
+function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId, warnings, maxTurns, outPath = null }) {
   return {
     cwd,
     model,
@@ -934,13 +1047,9 @@ function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessio
     resumeSessionId,
     jobId,
     maxTurns,
+    outPath,
     warnings: Array.isArray(warnings) ? warnings : []
   };
-}
-
-function readTaskPrompt(cwd, options, positionals) {
-  const positionalPrompt = positionals.join(" ");
-  return positionalPrompt || readStdinIfPiped();
 }
 
 async function runForegroundCommand(job, runner, options = {}) {
@@ -1012,7 +1121,8 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd", "max-turns"],
+    valueOptions: ["base", "scope", "model", "cwd", "max-turns", "focus-file", "out"],
+    multiValueOptions: ["exclude"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -1025,7 +1135,27 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const workspaceConfig = getConfig(workspaceRoot);
-  const focusText = positionals.join(" ").trim();
+  const takesFocus = config.reviewName !== "Review";
+  const positionalFocus = positionals.join(" ").trim();
+
+  if (takesFocus) {
+    // adversarial-review: focus text may come from argv or --focus-file, never both.
+    if (options["focus-file"] && positionalFocus) {
+      throw new Error("Pass either --focus-file <path> or positional focus text, not both.");
+    }
+  } else if (options["focus-file"] || positionalFocus) {
+    // review is native-review only: no focus text of any kind.
+    throw new Error(
+      positionalFocus
+        ? "`review` does not support focus text; use `adversarial-review` for a steerable review."
+        : "`review` does not support --focus-file; use `adversarial-review --focus-file <path>`."
+    );
+  }
+
+  const focusText = takesFocus && options["focus-file"] ? readTextOptionFile(cwd, options["focus-file"], "--focus-file") : positionalFocus;
+  const outPath = options.out ? path.resolve(cwd, options.out) : null;
+  const excludes = options.exclude ?? [];
+
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -1056,6 +1186,8 @@ async function handleReviewCommand(argv, config) {
         reviewName: config.reviewName,
         warnings,
         maxTurns,
+        excludes,
+        outPath,
         onProgress: progress
       }),
     { json: options.json }
@@ -1106,7 +1238,7 @@ function resolveTaskResumeCandidate(workspaceRoot) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "cwd", "max-turns"],
+    valueOptions: ["model", "cwd", "max-turns", "prompt-file", "out"],
     multiValueOptions: ["allow-bash"],
     booleanOptions: ["json", "continue", "background", "thinking", "wait", "read-only", "allow-paid", "fresh"],
     aliasMap: {
@@ -1115,7 +1247,9 @@ async function handleTask(argv) {
   });
 
   if (options["read-only"] && options["allow-bash"]) {
-    throw new Error("`--read-only` cannot be combined with `--allow-bash`.");
+    throw new Error(
+      "`--read-only` runs have no Bash, so `--allow-bash` can't apply. For a code review use `review`/`adversarial-review --base <ref>` (the diff is included for you), or write what the model needs into a file inside the working directory and reference its path."
+    );
   }
 
   // Throws (exit 1) on an invalid value. --continue deliberately does NOT
@@ -1134,7 +1268,13 @@ async function handleTask(argv) {
   const readOnly = Boolean(options["read-only"]);
   const origin = process.env[JOB_ORIGIN_ENV] === STOP_GATE_ORIGIN ? STOP_GATE_ORIGIN : null;
 
-  let prompt = readTaskPrompt(invocationCwd, options, positionals);
+  const positionalPrompt = positionals.join(" ");
+  if (options["prompt-file"] && positionalPrompt.trim()) {
+    throw new Error("Pass either --prompt-file <path> or a positional prompt, not both.");
+  }
+  let prompt = options["prompt-file"]
+    ? readTextOptionFile(invocationCwd, options["prompt-file"], "--prompt-file")
+    : positionalPrompt || readStdinIfPiped();
   let cwd = invocationCwd;
   let resumeSessionId = null;
   let carriedModel = null;
@@ -1161,8 +1301,8 @@ async function handleTask(argv) {
     }
   }
 
-  if (!prompt) {
-    throw new Error("Provide a prompt, piped stdin, or use --continue.");
+  if (!prompt || !prompt.trim()) {
+    throw new Error("Provide a prompt, --prompt-file <path>, piped stdin, or use --continue.");
   }
 
   const profile = readOnly ? "read" : continueSession && carriedProfile ? carriedProfile : "write";
@@ -1178,10 +1318,14 @@ async function handleTask(argv) {
 
   const taskMetadata = buildTaskRunMetadata({ prompt, continueSession });
 
+  // For background runs the absolute outPath travels in the stored request so
+  // the worker writes the file on completion; foreground runs write it here.
+  const outPath = options.out ? path.resolve(invocationCwd, options.out) : null;
+
   if (options.background) {
     ensureClaudeAvailable(cwd);
     const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write", origin);
-    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id, warnings, maxTurns });
+    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id, warnings, maxTurns, outPath });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
@@ -1190,8 +1334,8 @@ async function handleTask(argv) {
   const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write", origin);
   await runForegroundCommand(
     job,
-    (progress) =>
-      executeTaskRun({
+    async (progress) => {
+      const execution = await executeTaskRun({
         cwd,
         model,
         prompt,
@@ -1202,7 +1346,12 @@ async function handleTask(argv) {
         warnings,
         maxTurns,
         onProgress: progress
-      }),
+      });
+      if (outPath) {
+        writeResultOutFile(outPath, execution.payload.isError ? "" : execution.payload.rawOutput);
+      }
+      return execution;
+    },
     { json: options.json }
   );
 }

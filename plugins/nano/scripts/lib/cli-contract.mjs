@@ -50,7 +50,9 @@
  *                              `--model`, `--tools`, `--permission-mode
  *                              dontAsk`, `--allowedTools`, `--output-format
  *                              json|stream-json`, `--verbose` (with
- *                              stream-json), `--resume`.
+ *                              stream-json), `--resume`, `--add-dir` (so a
+ *                              spilled review diff can be read under
+ *                              `--restricted`).
  */
 export const REQUIRED_COMMANDS = [
   {
@@ -70,7 +72,8 @@ export const REQUIRED_COMMANDS = [
       { token: "stream-json", kind: "choice", note: "buildClaudeArgs() uses --output-format stream-json for streamed runs" },
       { token: "--verbose", kind: "flag", note: "buildClaudeArgs() passes --verbose with stream-json" },
       { token: "--resume", kind: "flag", note: "buildClaudeArgs() passes --resume <id> to resume a session" },
-      { token: "--model", kind: "flag", note: "buildClaudeArgs() passes --model <model>" }
+      { token: "--model", kind: "flag", note: "buildClaudeArgs() passes --model <model>" },
+      { token: "--add-dir", kind: "flag", note: "buildClaudeArgs() passes --add-dir=<dir> so a spilled review diff can be read under --restricted" }
     ]
   }
 ];
