@@ -48,6 +48,13 @@ export const FAKE_API_KEY = "nano-test-key-DO-NOT-LEAK-7f3a";
  * `options.delayMs` (default 5000) is used by behavior "slow".
  * `options.stderrText` overrides the stderr written by behavior
  * "no-result-error".
+ * `options.salvage` controls how the "max-turns" behavior answers the
+ * turn-limit salvage call (a resume with an empty `--tools=`): "none"
+ * (default) hits the cap again, "ok" returns `options.salvageText` (default
+ * "Salvaged write-up."), "error" returns an is_error result, exit 1.
+ *
+ * Stream-json assistant events carry `message.id` and `message.usage` like real
+ * claude; the first call is split into two events with the same id.
  */
 export function installFakeClaude(binDir, behavior = "ok", options = {}) {
   const version = options.version ?? "2.1.278";
@@ -65,6 +72,8 @@ const VERSION = ${JSON.stringify(version)};
 const RESULT_TEXT = ${JSON.stringify(resultText)};
 const DELAY_MS = ${JSON.stringify(delayMs)};
 const STDERR_TEXT = ${JSON.stringify(stderrText)};
+const SALVAGE = ${JSON.stringify(options.salvage ?? "none")};
+const SALVAGE_TEXT = ${JSON.stringify(options.salvageText ?? "Salvaged write-up.")};
 const INVOCATIONS_LOG = ${JSON.stringify(invocationsLog)};
 
 const argv = process.argv.slice(2);
@@ -306,6 +315,27 @@ function buildResultObject() {
   let permission_denials = [];
   let exitCode = 0;
 
+  if (effBehavior === "max-turns" && run.tools === "" && SALVAGE !== "none") {
+    const failed = SALVAGE === "error";
+    return {
+      type: "result",
+      subtype: "success",
+      is_error: failed,
+      result: failed ? "API Error: salvage failed" : SALVAGE_TEXT,
+      session_id: sessionId,
+      num_turns: 1,
+      duration_ms: 321,
+      usage: {
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_read_input_tokens: 400,
+        cache_creation_input_tokens: 10
+      },
+      permission_denials: [],
+      _exitCode: failed ? 1 : 0
+    };
+  }
+
   if (effBehavior === "max-turns") {
     // Matches real claude when the --max-turns cap is hit: exit 1 with a
     // normal result JSON of subtype error_max_turns.
@@ -392,16 +422,18 @@ function emitStreamLines(resultObject) {
   const cwd = process.cwd();
   const lines = [];
   lines.push({ type: "system", subtype: "init", session_id: sessionId, model: run.model, cwd: cwd });
-  lines.push({ type: "assistant", session_id: sessionId, message: { role: "assistant", content: [
-    { type: "text", text: "Looking around." },
+  lines.push({ type: "assistant", session_id: sessionId, message: { id: "msg_1", role: "assistant", content: [
+    { type: "text", text: "Looking around." }
+  ], usage: { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 5, output_tokens: 1 } } });
+  lines.push({ type: "assistant", session_id: sessionId, message: { id: "msg_1", role: "assistant", content: [
     { type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: cwd + "/README.md" } }
-  ] } });
+  ], usage: { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 5, output_tokens: 20 } } });
   lines.push({ type: "user", session_id: sessionId, message: { role: "user", content: [
     { type: "tool_result", tool_use_id: "toolu_1", content: "ok" }
   ] } });
-  lines.push({ type: "assistant", session_id: sessionId, message: { role: "assistant", content: [
+  lines.push({ type: "assistant", session_id: sessionId, message: { id: "msg_2", role: "assistant", content: [
     { type: "tool_use", id: "toolu_2", name: "Bash", input: { command: "git diff --stat" } }
-  ] } });
+  ], usage: { input_tokens: 12, cache_read_input_tokens: 30, cache_creation_input_tokens: 0, output_tokens: 15 } } });
   lines.push(resultObject);
   return lines;
 }

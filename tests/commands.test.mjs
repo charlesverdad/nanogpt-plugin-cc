@@ -50,7 +50,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
-  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[--max-turns <n>\] \[focus \.\.\.\]/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[--max-turns <n>\] \[--no-salvage\] \[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/nano-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"NanoGPT adversarial review"/);
@@ -76,7 +76,8 @@ test("commands directory exposes the expected user-facing commands", () => {
     "result.md",
     "review.md",
     "setup.md",
-    "status.md"
+    "status.md",
+    "usage.md"
   ]);
 });
 
@@ -150,6 +151,7 @@ test("rescue command forwards to the nano-rescue subagent verbatim", () => {
   assert.match(readme, /### \/nano:status/);
   assert.match(readme, /### \/nano:result/);
   assert.match(readme, /### \/nano:cancel/);
+  assert.match(readme, /### \/nano:usage/);
   assert.match(readme, /uses the same target selection as `\/nano:review`/i);
   assert.match(readme, /the NanoGPT model can read files but cannot edit them or run commands/i);
   assert.match(readme, /\| `read` \|/);
@@ -168,6 +170,14 @@ test("result and cancel commands are deterministic runtime entrypoints", () => {
   assert.match(result, /nano-companion\.mjs" result "\$ARGUMENTS"/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /nano-companion\.mjs" cancel "\$ARGUMENTS"/);
+});
+
+test("usage command runs the companion usage subcommand", () => {
+  const usage = read("commands/usage.md");
+  assert.match(usage, /disable-model-invocation:\s*true/);
+  assert.match(usage, /argument-hint: '\[--days <n>\] \[--json\]'/);
+  assert.match(usage, /allowed-tools:\s*Bash\(node:\*\)\s*$/m);
+  assert.match(usage, /nano-companion\.mjs" usage "\$ARGUMENTS"/);
 });
 
 test("internal runtime skill uses task terminology for rescue runs", () => {

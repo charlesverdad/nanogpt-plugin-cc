@@ -81,11 +81,12 @@ The key is resolved fresh for each run and is never written to job files, logs, 
 | `/nano:status` | Show running and recent NanoGPT jobs for this repo. |
 | `/nano:result` | Show the full stored output for a finished job. |
 | `/nano:cancel` | Cancel an active background job. |
+| `/nano:usage` | Summarize run history, failures, API-call latency and MCP tool usage. |
 
 ### /nano:rescue
 
 ```
-/nano:rescue [--background|--wait] [--continue|--fresh] [--model <id|alias>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [--prompt-file <path>] [--out <path>] <task>
+/nano:rescue [--background|--wait] [--continue|--fresh] [--model <id|alias>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [--no-salvage] [--prompt-file <path>] [--out <path>] <task>
 ```
 
 Hands a task to NanoGPT through the `nano:nano-rescue` subagent. **This only ever runs when you ask for it** — by name (`/nano:rescue`) or by telling Claude to hand something to NanoGPT; Claude does not use it proactively, and it is meant for short, well-scoped tasks. Use it to investigate a bug, try a fix, or continue a previous NanoGPT session. By default the task runs in the foreground; use `--background` to run it as a background job.
@@ -98,8 +99,9 @@ Hands a task to NanoGPT through the `nano:nano-rescue` subagent. **This only eve
 - `--allow-bash <prefix>` — add a Bash prefix to the allowlist for this run (repeatable). The command then runs with any arguments; see [Permission Profiles](#permission-profiles) for the risk.
 - `--allow-paid` — allow a non-subscription (pay-per-token) model. Refused otherwise.
 - `--max-turns <n>` — cap the run at `n` turns (1-500, default 25). See [Turn Caps](#turn-caps) below.
+- `--no-salvage` — do not make the extra no-tools call that summarizes a run which hit its turn cap (see [Turn Caps](#turn-caps)).
 - `--prompt-file <path>` — read the task prompt from a UTF-8 file instead of the positional text (path relative to the command cwd; cannot be combined with a positional task).
-- `--out <path>` — write only the model's final result text (no header, footer, or warnings) to `<path>` after the run, relative to the command cwd. Parent directories are created and an existing file is overwritten. With `--background`, the worker writes the file on completion. If the run produced no result text, no file is written and a notice goes to stderr.
+- `--out <path>` — write only the model's final result text (no header, footer, or warnings) to `<path>` after the run, relative to the command cwd. Parent directories are created and an existing regular file is replaced atomically (temp file + rename); a symlink or directory destination is refused. If the write fails the run exits non-zero, the payload gets `outError`, and a background job is marked failed. With `--background`, the worker writes the file on completion. If the run produced no result text, no file is written and a notice goes to stderr.
 
 Examples:
 
@@ -115,21 +117,21 @@ Examples:
 ### /nano:review
 
 ```
-/nano:review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--exclude <glob>] [--max-turns <n>] [--out <path>]
+/nano:review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--exclude <glob>] [--max-turns <n>] [--no-salvage] [--out <path>]
 ```
 
-Runs a read-only NanoGPT review on your current uncommitted changes or your branch compared to a base ref. The NanoGPT model can read files but cannot edit them or run commands. It is not steerable and does not take focus text. Use `--base <ref>` for branch review. `--scope` defaults to `auto`. `--max-turns <n>` caps the review at `n` turns (default 15); reviews are read-only and rarely need more.
+Runs a read-only NanoGPT review on your current uncommitted changes or your branch compared to a base ref. The NanoGPT model can read files but cannot edit them or run commands. It is not steerable and does not take focus text. Use `--base <ref>` for branch review. `--scope` defaults to `auto`. `--max-turns <n>` caps the review at `n` turns (default 15); reviews are read-only and rarely need more. `--no-salvage` disables the turn-limit finalize call (see [Turn Caps](#turn-caps)).
 
 `--exclude <glob>` (repeatable) keeps matching files out of the inline diff. A pattern without `/` matches at any depth (`*.snap`); one with `/` is relative to the repo root (`docs/**`). Lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `Cargo.lock`, and other common ones) are excluded by default at any depth, and binary files are never inlined — git prints a one-line "Binary files … differ" instead of a base85 payload. Excluded files still appear in the Git Status and Diff Stat sections, and an "Omitted from the inline diff" line lists them (up to 20 names).
 
-`--out <path>` writes only the model's final review text (no header, footer, or warnings) to `<path>` relative to the command cwd; parent directories are created and an existing file is overwritten. If the review produced no result text, no file is written and a notice goes to stderr.
+`--out <path>` writes only the model's final review text (no header, footer, or warnings) to `<path>` relative to the command cwd; parent directories are created and an existing regular file is replaced atomically; a symlink or directory destination is refused, and a failed write makes the run exit non-zero (`outError` in the JSON payload). If the review produced no result text, no file is written and a notice goes to stderr.
 
 **Large diffs:** when the inline diff exceeds `NANO_REVIEW_INLINE_BYTES` (default 200000 bytes; set it to a positive integer to change), the diff is written to a private temporary file (`review.diff`, mode 0600) and the prompt points the model at its path instead of inlining it — Git Status, Commit Log, and Diff Stat stay inline. The model is granted Read access to that file's directory for the duration of the run, and the temporary directory is deleted afterwards. This keeps reviews of large branches working: claude refuses a stdin prompt over 10 MB.
 
 ### /nano:adversarial-review
 
 ```
-/nano:adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--exclude <glob>] [--max-turns <n>] [--focus-file <path>] [--out <path>] [focus ...]
+/nano:adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--exclude <glob>] [--max-turns <n>] [--no-salvage] [--focus-file <path>] [--out <path>] [focus ...]
 ```
 
 Runs a steerable review that questions the chosen implementation, design tradeoffs, and assumptions. Like `/nano:review`, it is read-only: the NanoGPT model can read files but cannot edit them or run commands. It uses the same target selection as `/nano:review` (including the `--exclude`, lockfile/binary exclusion, and large-diff spill behavior), and additionally accepts focus text after the flags or via `--focus-file <path>` (read from a UTF-8 file, path relative to the command cwd; the two cannot be combined). `--max-turns <n>` caps the review at `n` turns (default 15). Use it to pressure-test specific risk areas like auth, data loss, race conditions, or rollback. `--out <path>` works exactly as for `/nano:review`.
@@ -162,6 +164,14 @@ Shows running and recent jobs for this repo. With a job id, shows full detail fo
 ```
 
 Shows the full stored output for a finished job. Defaults to the latest finished job.
+
+### /nano:usage
+
+```
+/nano:usage [--days <n>] [--json]
+```
+
+Summarizes `runs.jsonl` (and the MCP proxy's `mcp-calls.jsonl`, if present) over the last `n` days (default 7; a positive integer). It prints the log paths, totals (runs, ok/error, input and output tokens, summed `quotaDelta`, which overstates usage when runs overlap because each delta is a before/after snapshot of the whole account), runs by kind and by model, failures by cause (`max_turns` salvaged or not, no result, prompt too long, other), API-call latency (p50/p95/max over every recorded call), the five slowest runs, and per-tool MCP calls, errors, tokens, average latency and saved media. Lines written by older versions, which lack the newer fields, are still counted. `--json` prints the same aggregates as JSON. Run it as `node scripts/nano-companion.mjs usage` outside Claude Code.
 
 ### /nano:cancel
 
@@ -225,13 +235,29 @@ Every run is capped at a fixed number of conversational turns, so a task or revi
 - `n` must be an integer from 1 to 500; an invalid value exits 1 before anything is invoked.
 - The stop-time review gate (see below) always uses 15.
 
-When a run hits its cap, `claude` exits 1 with a normal result whose `subtype` is `error_max_turns`. The plugin renders this as its own outcome, not a generic failure:
+When a run hits its cap, `claude` exits 1 with a normal result whose `subtype` is `error_max_turns` and an empty `result`, so by default the investigation would be thrown away. Instead the plugin salvages it: it resumes the same session once more with no tools (`--tools=`, `--max-turns 1`, same model, `--restricted --strict-mcp-config --permission-mode dontAsk`, no `--allowedTools`) and asks the model to write up what it already found. For a review the prompt asks for the final review in the required format plus a short list of areas it did not get to check; for a task it asks for a summary of what was done, which files changed, what was verified and what remains. The stop-time review gate salvages too, with a prompt asking for its `ALLOW:`/`BLOCK:` verdict.
+
+If the salvage call returns text, the run succeeds (exit 0, a background job ends `completed`) and the output starts with a one-line note:
+
+```
+Finalized at the turn limit (15 turns); some areas may be unchecked.
+```
+
+for reviews, or
+
+```
+Stopped at the turn limit (25 turns). Summary of progress so far — continue with --continue or rerun with a higher --max-turns.
+```
+
+for tasks, followed by the model's text. The JSON payload keeps `stopReason: "max_turns"` and `maxTurns: <n>`, and gains `salvaged: true` and `salvageUsage` (the salvage call's usage); `usage` and the footer are the sum of both calls. The session id is unchanged, so `/nano:rescue --continue` (or `task --continue`) still resumes exactly where it stopped. `--out` writes the salvaged text.
+
+If the salvage call fails or returns nothing, the run behaves as before: exit 1, the message below, `salvaged: false`, no `--out` file (a background job is marked `failed`):
 
 ```
 Stopped at the turn limit (25 turns) before finishing. Continue where it left off with --continue, or rerun with a higher --max-turns.
 ```
 
-The JSON payload for that run has `stopReason: "max_turns"` and `maxTurns: <n>`. The NanoGPT/Claude session id is still recorded, so `/nano:rescue --continue` (or `task --continue`) resumes exactly where it stopped; a background job that hits the cap is marked `failed` with the same message. `--continue` never carries a previous run's `--max-turns` over — it uses the new run's flag, or the default.
+Pass `--no-salvage` to `rescue`/`task`, `review` or `adversarial-review` to skip the extra call and get that failure straight away. The salvage call costs one more turn that resends the whole conversation, so it uses quota too. `--continue` never carries a previous run's `--max-turns` over — it uses the new run's flag, or the default.
 
 ## Models
 
@@ -309,7 +335,23 @@ When tool calls were denied, the footer ends with `denied=` and the denied tool 
 | `week` | Present only when computable. How full the weekly quota window is right after the run, as a percent. |
 | `denied` | Present only when tool calls were denied. Lists the denied tool and detail, e.g. `Bash(rm -rf build)`. Rerun with `--allow-bash` to grant the command. |
 
-Run metrics are appended as one JSON line per run to `${CLAUDE_PLUGIN_DATA}/runs.jsonl` (falling back to `$TMPDIR/nano-companion-<uid>/runs.jsonl`, a per-user directory kept at mode 0700; job state and the model catalog cache use the same fallback).
+Run metrics are appended as one JSON line per run to `${CLAUDE_PLUGIN_DATA}/runs.jsonl` (falling back to `$TMPDIR/nano-companion-<uid>/runs.jsonl`, a per-user directory kept at mode 0700; job state and the model catalog cache use the same fallback). Every run streams (`--output-format stream-json --verbose`), so tool progress lines also reach foreground stderr and job logs, and per-API-call data is recorded.
+
+Each line has the original fields (`ts model cwd tools is_error turns in cache_read out ms denials session quotaDelta task`; `task` is the first 300 characters of the prompt) and these additions:
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | `review`, `adversarial-review`, `task`, `stop-gate` or `ping` (the `/nano:setup` live ping, which logs its model, usage tokens, `ms`, `is_error` and `error`). |
+| `jobId`, `exit` | The job id (or null) and the run's exit status. |
+| `subtype`, `terminalReason`, `stopReason` | claude's result `subtype` and `terminal_reason`; `stopReason` is `max_turns` or null. |
+| `error` | At most 500 characters: the result text when `is_error`, `claude exited <n>: <stderr head>` when there was no result object, otherwise null. API keys are never logged. |
+| `cache_creation` | Cache-creation input tokens. `in`, `cache_read`, `cache_creation` and `out` include the salvage call. |
+| `promptBytes`, `spilledDiffBytes` | UTF-8 size of the prompt, and of the spilled review diff file (null if none). |
+| `wallMs`, `maxTurns` | Wall time measured around the spawn (salvage included) and the turn cap. |
+| `salvaged`, `salvage` | `true`/`false` when a turn-limit salvage was attempted, else null; `salvage` is `{ in, cache_read, out, ms }` for that call or null. |
+| `calls`, `callMsMax`, `callMsP50` | One `{ ms, in, cache_read, cache_creation, out }` entry per distinct API call (assistant `message.id`), with the salvage call last, marked `salvage: true`. `ms` is the wall time from the spawn or the previous tool result to the call's first event, so it includes queueing and generation. |
+
+`/nano:usage` (or `node scripts/nano-companion.mjs usage`) turns these logs into a report; see [/nano:usage](#nanousage).
 
 ## Calling the Companion Directly
 

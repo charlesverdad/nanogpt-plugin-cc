@@ -24,7 +24,7 @@ Subagents started with the Agent tool always run on Claude. To save Claude token
   - default `z-ai/glm-5.2`; alternatives `minimax/minimax-m3`, `qwen/qwen3.8-27b` (1× quota)
   - hard problems: `z-ai/glm-5.3`, `deepseek/deepseek-v4-pro-0813` (2× quota)
   - trivial or fast: `z-ai/glm-5.3-flash`, `deepseek/deepseek-v4.1-flash`
-- **For a second opinion without file access,** `mcp__nanogpt__nanogpt_chat` also works (if that MCP is connected). Don't paste large files into it: you pay output tokens to write the prompt.
+- **For a second opinion without file access,** `mcp__plugin_nano_nanogpt__nanogpt_chat` also works (the plugin's logging MCP proxy; calls and generated images are recorded under `~/.claude/plugins/data/nano-nanogpt-plugin-cc/`). Don't paste large files into it: you pay output tokens to write the prompt.
 
 ### Record the experience (required)
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -43,8 +44,13 @@ import {
   buildChildEnv,
   buildClaudeArgs,
   buildPermissionProfile,
+  buildPingLogEntry,
+  buildRunErrorText,
   buildRunLogEntry,
   compareVersions,
+  createCallTracker,
+  readTranscriptUsage,
+  resolveSessionTranscript,
   DEFAULT_BASH_ALLOW,
   DEFAULT_REVIEW_MAX_TURNS,
   DEFAULT_TASK_MAX_TURNS,
@@ -61,6 +67,10 @@ import {
   parseClaudeVersion,
   requireApiKey,
   resolveApiKey,
+  resolveRunLogFile,
+  REVIEW_SALVAGE_PROMPT,
+  STOP_GATE_SALVAGE_PROMPT,
+  TASK_SALVAGE_PROMPT,
   resolveBaseUrl,
   resolveMaxInlineChars,
   resolveReviewInlineBytes,
@@ -68,6 +78,7 @@ import {
   shouldSendPromptViaStdin,
   summarizeClaudeResult
 } from "./lib/runtime.mjs";
+import { buildUsageReport, parseJsonl, renderUsageReport } from "./lib/usage-report.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import {
@@ -145,12 +156,13 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/nano-companion.mjs setup [--json]",
-      "  node scripts/nano-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--exclude <glob>] [--model <model>] [--max-turns <n>] [--out <path>]",
-      "  node scripts/nano-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--exclude <glob>] [--model <model>] [--max-turns <n>] [--focus-file <path>] [--out <path>] [focus text]",
-      "  node scripts/nano-companion.mjs task [--background] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [--prompt-file <path>] [--out <path>] [prompt]",
+      "  node scripts/nano-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--exclude <glob>] [--model <model>] [--max-turns <n>] [--no-salvage] [--out <path>]",
+      "  node scripts/nano-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--exclude <glob>] [--model <model>] [--max-turns <n>] [--no-salvage] [--focus-file <path>] [--out <path>] [focus text]",
+      "  node scripts/nano-companion.mjs task [--background] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [--no-salvage] [--prompt-file <path>] [--out <path>] [prompt]",
       "  node scripts/nano-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/nano-companion.mjs result [job-id] [--json]",
-      "  node scripts/nano-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/nano-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/nano-companion.mjs usage [--days <n>] [--json]"
     ].join("\n")
   );
 }
@@ -221,9 +233,14 @@ function firstMeaningfulLine(text, fallback) {
 
 /**
  * Write only the model's final result text (no header, footer, or warnings)
- * to `outPath` (absolute). Parent dirs are created. When there is no result
- * text (claude returned nothing), the file is not written and a notice goes to
- * stderr so the caller knows. stdout output is left untouched.
+ * to `outPath` (absolute). Parent dirs are created. The destination is
+ * refused when it is a symlink or a directory; otherwise the text goes to an
+ * exclusively created temp file in the same directory that is renamed over
+ * the destination, so a failed write never truncates an existing report.
+ * Returns an error message when the write failed, else null. When there is no
+ * result text (claude returned nothing), the file is not written and a notice
+ * goes to stderr; that alone is not a write failure (returns null). stdout
+ * output is left untouched.
  */
 function writeResultOutFile(outPath, text) {
   const body = String(text ?? "");
@@ -231,14 +248,61 @@ function writeResultOutFile(outPath, text) {
     // A missing file signals failure to the caller, so an error run never
     // writes one.
     process.stderr.write("[nano] no result text; --out file not written\n");
-    return;
+    return null;
   }
+  let tmpPath = null;
   try {
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
-    fs.writeFileSync(outPath, body.endsWith("\n") ? body : `${body}\n`);
+    let existing = null;
+    try {
+      existing = fs.lstatSync(outPath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    if (existing?.isSymbolicLink()) {
+      throw new Error("destination is a symlink");
+    }
+    if (existing?.isDirectory()) {
+      throw new Error("destination is a directory");
+    }
+    tmpPath = path.join(path.dirname(outPath), `.${path.basename(outPath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`);
+    fs.writeFileSync(tmpPath, body.endsWith("\n") ? body : `${body}\n`, { flag: "wx", mode: 0o644 });
+    fs.renameSync(tmpPath, outPath);
+    tmpPath = null;
+    return null;
   } catch (error) {
-    process.stderr.write(`[nano] could not write --out file ${outPath}: ${error instanceof Error ? error.message : String(error)}\n`);
+    if (tmpPath) {
+      try {
+        fs.rmSync(tmpPath, { force: true });
+      } catch {
+        // best-effort temp cleanup
+      }
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[nano] could not write --out file ${outPath}: ${reason}\n`);
+    return reason;
   }
+}
+
+/**
+ * Apply the `--out` write to a finished run's result. Returns `{ outError,
+ * exitStatus, rendered }`: on a write failure the exit status is non-zero and
+ * the rendered text ends with a `Could not write --out file` line.
+ */
+function applyOutFile(outPath, run, rendered) {
+  const outError = outPath
+    ? writeResultOutFile(outPath, run.summary && !run.summary.isError ? run.summary.text : "")
+    : null;
+  if (!outError) {
+    return { outError: null, exitStatus: run.exitStatus, rendered };
+  }
+  return {
+    outError,
+    exitStatus: run.exitStatus || 1,
+    rendered: `${String(rendered ?? "").replace(/\s+$/, "")}\n\nCould not write --out file ${outPath}: ${outError}\n`
+  };
 }
 
 /**
@@ -413,7 +477,13 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   if (!apiKey) {
     pingDetail = "skipped: no API key";
   } else {
+    const pingStart = Date.now();
     const ping = await pingNanoGpt({ apiKey, baseUrl, model: pingModel });
+    try {
+      appendRunLog(buildPingLogEntry({ model: pingModel, cwd, ping, ms: Date.now() - pingStart }));
+    } catch {
+      // metrics are best-effort
+    }
     pingOk = ping.ok;
     pingDetail = `${pingModel}: ${ping.detail}`;
   }
@@ -584,7 +654,8 @@ async function handleSetup(argv) {
 
 /**
  * request = { cwd, prompt, model, profile ("read"|"write"), bashAllow,
- *   resumeSessionId, streaming, onProgress, onSession, maxTurns, addDirs }
+ *   resumeSessionId, onProgress, onSession, maxTurns, addDirs, salvagePrompt,
+ *   kind, jobId, spilledDiffBytes }
  *
  * The permission profile is always rebuilt here from its name and the Bash
  * allowlist (validated by normalizeBashAllow); a ready-made tools/allowedTools
@@ -598,18 +669,27 @@ async function handleSetup(argv) {
  * The API key is resolved fresh here (never taken from `request`), so a
  * queued background job's stored request never contains it. Returns
  * `{ exitStatus, summary (null if no JSON), permissions, model, quota,
- * stderr, stdout }`. `exitStatus` is 0 only if the process exited 0 AND the
- * stdout parsed as JSON AND `summary.isError` is false.
+ * stderr, stdout, salvaged, salvageUsage }`. `exitStatus` is 0 only if the
+ * process exited 0 AND the stdout parsed as JSON AND `summary.isError` is
+ * false.
  *
  * `quota` is built from subscription usage snapshots taken just before and
  * just after the run (see buildRunQuota). A failed or slow usage fetch never
  * fails the run: `quota` is null when the after-snapshot failed.
  *
- * With `streaming` the run uses `--output-format stream-json --verbose` and
- * each stdout line is fed to parseStreamEvent: progress strings are passed to
- * `onProgress` (so they land in the job log) and the first session id seen is
- * passed to `onSession` and returned as `streamSessionId`. The final summary
- * still comes from the last `type: "result"` line via parseClaudeJsonOutput.
+ * Every run uses `--output-format stream-json --verbose`: each stdout line is
+ * fed to parseStreamEvent (progress strings go to `onProgress`, the first
+ * session id seen to `onSession` and `streamSessionId`) and to a call tracker
+ * that records per-API-call latency and tokens for the run log. The final
+ * summary still comes from the last `type: "result"` line.
+ *
+ * Turn-limit salvage: when the run stops at --max-turns, has a session id and
+ * `salvagePrompt` is set, one more no-tools, one-turn call resumes the session
+ * and asks the model to write up what it found. If that returns non-error
+ * text, the returned `summary` carries it (usage summed over both calls, same
+ * session id), `exitStatus` is 0 and `salvaged` is true; otherwise the
+ * original result is returned unchanged with `salvaged` false. `salvaged` is
+ * null when salvage did not apply or was not requested.
  */
 async function executeClaudeRun({
   cwd,
@@ -618,11 +698,14 @@ async function executeClaudeRun({
   profile,
   bashAllow,
   resumeSessionId = null,
-  streaming = false,
   onProgress = null,
   onSession = null,
   maxTurns = null,
-  addDirs = []
+  addDirs = [],
+  salvagePrompt = null,
+  kind = null,
+  jobId = null,
+  spilledDiffBytes = null
 } = {}) {
   if (typeof profile !== "string") {
     throw new Error('Invalid permission profile: expected "read" or "write".');
@@ -641,7 +724,7 @@ async function executeClaudeRun({
     model,
     profile: permissions,
     resumeSessionId,
-    outputFormat: streaming ? "stream-json" : "json",
+    outputFormat: "stream-json",
     promptViaStdin,
     maxTurns,
     addDirs
@@ -651,26 +734,30 @@ async function executeClaudeRun({
     onProgress(`Running NanoGPT (${model}, profile=${permissions.name})...`);
   }
 
+  // Replace every occurrence of the key in anything claude printed, before it
+  // is parsed, rendered, stored or logged.
+  const scrub = (text) => (text == null || !apiKey ? text : String(text).split(apiKey).join("[redacted]"));
+
   let streamSessionId = null;
-  const onStdoutLine = streaming
-    ? (line) => {
-        const event = parseStreamEvent(line, { cwd });
-        if (!event) {
-          return;
-        }
-        if (event.sessionId && !streamSessionId) {
-          streamSessionId = event.sessionId;
-          if (typeof onSession === "function") {
-            onSession(event.sessionId);
-          }
-        }
-        for (const text of event.progress) {
-          if (typeof onProgress === "function") {
-            onProgress(text);
-          }
-        }
+  const tracker = createCallTracker();
+  const onStdoutLine = (line) => {
+    const event = parseStreamEvent(scrub(line), { cwd });
+    if (!event) {
+      return;
+    }
+    tracker.onEvent(event.event);
+    if (event.sessionId && !streamSessionId) {
+      streamSessionId = event.sessionId;
+      if (typeof onSession === "function") {
+        onSession(event.sessionId);
       }
-    : null;
+    }
+    for (const text of event.progress) {
+      if (typeof onProgress === "function") {
+        onProgress(text);
+      }
+    }
+  };
 
   // Quota snapshots around the run. fetchSubscriptionUsage never throws, but
   // guard anyway: a quota read must never fail the run.
@@ -683,20 +770,125 @@ async function executeClaudeRun({
   };
   const usageBefore = await fetchUsage();
 
-  const result = await runClaude({
+  const startedAt = Date.now();
+  // Call latency starts at the spawn, not at the quota preflight above.
+  tracker.start();
+  const rawResult = await runClaude({
     cwd,
     args,
     env,
     input: promptViaStdin ? prompt : null,
     onStdoutLine
   });
+  const result = { ...rawResult, stdout: scrub(rawResult.stdout), stderr: scrub(rawResult.stderr) };
+  const mainWallMs = Date.now() - startedAt;
+
+  const parsed = parseClaudeJsonOutput(result.stdout);
+  const originalSummary = parsed ? summarizeClaudeResult(parsed) : null;
+  let summary = originalSummary;
+  let exitStatus = result.status === 0 && summary && summary.isError === false ? 0 : (result.status || 1);
+  const runSessionId = originalSummary?.sessionId ?? streamSessionId;
+  tracker.applyUsage(readTranscriptUsage(resolveSessionTranscript(runSessionId, { cwd, env })));
+  const calls = tracker.calls();
+
+  // Turn-limit salvage: resume the session with no tools and ask for a
+  // write-up. Any failure here leaves the original result untouched.
+  let salvaged = null;
+  let salvageSummary = null;
+  let salvageMs = 0;
+  if (salvagePrompt && isMaxTurnsStop(originalSummary) && originalSummary.sessionId) {
+    salvaged = false;
+    if (typeof onProgress === "function") {
+      onProgress(`Turn limit reached; asking ${model} to finalize without tools...`);
+    }
+    const salvageStart = Date.now();
+    try {
+      const rawSalvageResult = await runClaude({
+        cwd,
+        args: buildClaudeArgs({
+          prompt: salvagePrompt,
+          model,
+          noTools: true,
+          resumeSessionId: originalSummary.sessionId,
+          outputFormat: "json",
+          maxTurns: 1,
+          addDirs
+        }),
+        env
+      });
+      const salvageResult = {
+        ...rawSalvageResult,
+        stdout: scrub(rawSalvageResult.stdout),
+        stderr: scrub(rawSalvageResult.stderr)
+      };
+      const salvageParsed = parseClaudeJsonOutput(salvageResult.stdout);
+      salvageSummary = salvageParsed ? summarizeClaudeResult(salvageParsed) : null;
+      if (
+        salvageResult.status === 0 &&
+        salvageSummary &&
+        salvageSummary.isError === false &&
+        salvageSummary.text.trim()
+      ) {
+        salvaged = true;
+      }
+    } catch {
+      salvageSummary = null;
+    }
+    salvageMs = Date.now() - salvageStart;
+  }
+
+  const sumUsage = (a, b) => {
+    const total = { ...a };
+    for (const key of ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"]) {
+      total[key] = (Number(a?.[key]) || 0) + (Number(b?.[key]) || 0);
+    }
+    return total;
+  };
+  // The run log always counts the salvage call's tokens (they were spent
+  // either way); the returned summary only does when salvage succeeded.
+  const loggedUsage = salvageSummary ? sumUsage(originalSummary.usage, salvageSummary.usage) : originalSummary?.usage;
+  if (salvaged === true) {
+    summary = {
+      ...originalSummary,
+      text: salvageSummary.text,
+      isError: false,
+      usage: loggedUsage
+    };
+    exitStatus = 0;
+  }
 
   const usageAfter = await fetchUsage();
   const quota = buildRunQuota(usageBefore, usageAfter);
 
-  const parsed = parseClaudeJsonOutput(result.stdout);
-  const summary = parsed ? summarizeClaudeResult(parsed) : null;
-  const exitStatus = result.status === 0 && summary && summary.isError === false ? 0 : (result.status || 1);
+  const salvageEntry = salvageSummary
+    ? {
+        in: salvageSummary.usage.input_tokens ?? 0,
+        cache_read: salvageSummary.usage.cache_read_input_tokens ?? 0,
+        out: salvageSummary.usage.output_tokens ?? 0,
+        ms: salvageMs
+      }
+    : null;
+  const loggedCalls = salvageSummary
+    ? [
+        ...calls,
+        {
+          ms: salvageMs,
+          in: salvageSummary.usage.input_tokens ?? 0,
+          cache_read: salvageSummary.usage.cache_read_input_tokens ?? 0,
+          cache_creation: salvageSummary.usage.cache_creation_input_tokens ?? 0,
+          out: salvageSummary.usage.output_tokens ?? 0,
+          salvage: true
+        }
+      ]
+    : calls;
+
+  const runError = buildRunErrorText({
+    summary: originalSummary,
+    parsedErrors: parsed?.errors,
+    exitStatus,
+    stderr: result.stderr,
+    redact: scrub
+  });
 
   appendRunLog(
     buildRunLogEntry({
@@ -705,14 +897,28 @@ async function executeClaudeRun({
       allowedTools: permissions.allowedTools,
       task: prompt,
       quotaDelta: quota?.delta ?? null,
-      summary: summary ?? {
-        isError: true,
-        numTurns: null,
-        usage: {},
-        durationMs: null,
-        permissionDenials: [],
-        sessionId: null
-      }
+      kind,
+      jobId,
+      exit: exitStatus,
+      error: scrub(salvaged === true ? null : runError),
+      promptBytes: Buffer.byteLength(prompt, "utf8"),
+      spilledDiffBytes,
+      wallMs: mainWallMs + salvageMs,
+      maxTurns,
+      stopReason: isMaxTurnsStop(originalSummary) ? "max_turns" : null,
+      salvaged,
+      salvage: salvageEntry,
+      calls: loggedCalls,
+      summary: originalSummary
+        ? { ...originalSummary, isError: salvaged === true ? false : originalSummary.isError, usage: loggedUsage }
+        : {
+            isError: true,
+            numTurns: null,
+            usage: {},
+            durationMs: null,
+            permissionDenials: [],
+            sessionId: null
+          }
     })
   );
 
@@ -724,7 +930,9 @@ async function executeClaudeRun({
     model,
     quota,
     stderr: result.stderr,
-    stdout: result.stdout
+    stdout: result.stdout,
+    salvaged,
+    salvageUsage: salvaged === true ? salvageSummary.usage : null
   };
 }
 
@@ -772,7 +980,11 @@ async function executeReviewRun(request) {
   let content = context.content;
   let addDirs = [];
   let spillDir = null;
-  if (context.inlineDiffBytes > inlineBudget) {
+  let spilledDiffBytes = null;
+  // The cleanup scope starts before the spill dir exists, so writing, prompt
+  // building and the size guard are all covered.
+  try {
+    if (context.inlineDiffBytes > inlineBudget) {
     spillDir = fs.mkdtempSync(path.join(os.tmpdir(), "nano-review-"));
     fs.chmodSync(spillDir, 0o700);
     const spillPath = path.join(spillDir, "review.diff");
@@ -780,22 +992,22 @@ async function executeReviewRun(request) {
     const spillLines = context.inlineDiffText.split("\n").length;
     content = buildSpilledContent(context.sections, spillPath, context.inlineDiffBytes, spillLines);
     addDirs = [spillDir];
-  }
+    spilledDiffBytes = fs.statSync(spillPath).size;
+    }
 
-  const prompt = buildReviewPrompt({ ...context, content }, focusText, reviewName === "Adversarial Review");
+    const prompt = buildReviewPrompt({ ...context, content }, focusText, reviewName === "Adversarial Review");
 
-  // Hard ceiling before spawning: even after spilling the diff, a huge focus
-  // text or commit log could still exceed claude's 10 MB stdin limit. Fail
-  // with our own message rather than letting claude exit 1 with an empty
-  // result.
-  const promptBytes = Buffer.byteLength(prompt, "utf8");
-  if (promptBytes > MAX_PROMPT_BYTES) {
-    throw new Error(
-      `Prompt is ${promptBytes} bytes; claude accepts at most 10 MB on stdin. Narrow the review with --exclude or --base.`
-    );
-  }
+    // Hard ceiling before spawning: even after spilling the diff, a huge focus
+    // text or commit log could still exceed claude's 10 MB stdin limit. Fail
+    // with our own message rather than letting claude exit 1 with an empty
+    // result.
+    const promptBytes = Buffer.byteLength(prompt, "utf8");
+    if (promptBytes > MAX_PROMPT_BYTES) {
+      throw new Error(
+        `Prompt is ${promptBytes} bytes; claude accepts at most 10 MB on stdin. Narrow the review with --exclude or --base.`
+      );
+    }
 
-  try {
     const run = await executeClaudeRun({
       cwd: request.cwd,
       prompt,
@@ -803,16 +1015,23 @@ async function executeReviewRun(request) {
       profile: "read",
       maxTurns: request.maxTurns ?? null,
       onProgress: request.onProgress,
-      addDirs
+      addDirs,
+      salvagePrompt: request.salvage === false ? null : REVIEW_SALVAGE_PROMPT,
+      kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
+      jobId: request.jobId ?? null,
+      spilledDiffBytes
     });
 
     const maxTurns = request.maxTurns ?? null;
+    const salvaged = run.salvaged === true;
+    // A salvaged run still ended at the turn cap (summary.terminalReason), but
+    // finished with text, so it is not rendered as a failure.
     const stoppedAtMaxTurns = isMaxTurnsStop(run.summary);
     const warnings = Array.isArray(request.warnings) ? request.warnings : [];
     // When claude printed no result object, surface its real stderr (first 20
     // lines) instead of crashing on a null summary.
     const noResultError = run.summary ? null : buildNoResultError(run.exitStatus, run.stderr);
-    const rendered = renderReviewResult({
+    const renderedBase = renderReviewResult({
       reviewLabel: reviewName,
       targetLabel: context.target.label,
       summary: run.summary,
@@ -822,7 +1041,8 @@ async function executeReviewRun(request) {
       warnings,
       quota: run.quota,
       maxTurns,
-      exitStatus: run.summary ? null : run.exitStatus
+      exitStatus: run.summary ? null : run.exitStatus,
+      salvaged
     });
 
     const payload = {
@@ -840,6 +1060,8 @@ async function executeReviewRun(request) {
       durationMs: run.summary?.durationMs ?? null,
       quota: run.quota ?? null,
       stopReason: stoppedAtMaxTurns ? "max_turns" : null,
+      salvaged: run.salvaged,
+      ...(salvaged ? { salvageUsage: run.salvageUsage } : {}),
       maxTurns,
       stderr: run.stderr,
       warnings,
@@ -847,16 +1069,19 @@ async function executeReviewRun(request) {
     };
 
     // --out: write only the model's final result text (no header/footer/
-    // warnings) to a file, relative to the command cwd.
-    if (request.outPath) {
-      writeResultOutFile(request.outPath, run.summary && !run.summary.isError ? run.summary.text : "");
+    // warnings) to a file, relative to the command cwd. A failed write fails
+    // the run.
+    const out = applyOutFile(request.outPath, run, renderedBase);
+    if (out.outError) {
+      payload.status = out.exitStatus;
+      payload.outError = out.outError;
     }
 
     return {
-      exitStatus: run.exitStatus,
+      exitStatus: out.exitStatus,
       payload,
-      rendered,
-      summary: stoppedAtMaxTurns
+      rendered: out.rendered,
+      summary: stoppedAtMaxTurns && !salvaged
         ? maxTurnsStopMessage(maxTurns, { canContinue: false })
         : run.summary
           ? firstMeaningfulLine(run.summary.text, `${reviewName} completed.`)
@@ -885,6 +1110,8 @@ async function executeTaskRun(request) {
 
   const prompt = request.prompt || "Continue from where you left off.";
   const maxTurns = request.maxTurns ?? null;
+  // The stop-time review gate runs as a `task`; the hook marks it by env.
+  const isStopGate = process.env[JOB_ORIGIN_ENV] === STOP_GATE_ORIGIN;
 
   const run = await executeClaudeRun({
     cwd: request.cwd,
@@ -893,18 +1120,21 @@ async function executeTaskRun(request) {
     profile: request.profile,
     bashAllow: request.bashAllow,
     resumeSessionId: request.resumeSessionId ?? null,
-    streaming: request.streaming ?? false,
     maxTurns,
     onProgress: request.onProgress,
-    onSession: request.onSession
+    onSession: request.onSession,
+    salvagePrompt: request.salvage === false ? null : isStopGate ? STOP_GATE_SALVAGE_PROMPT : TASK_SALVAGE_PROMPT,
+    kind: isStopGate ? "stop-gate" : "task",
+    jobId: request.jobId ?? null
   });
 
+  const salvaged = run.salvaged === true;
   const stoppedAtMaxTurns = isMaxTurnsStop(run.summary);
   const warnings = Array.isArray(request.warnings) ? request.warnings : [];
   // When claude printed no result object, surface its real stderr (first 20
   // lines) instead of crashing on a null summary.
   const noResultError = run.summary ? null : buildNoResultError(run.exitStatus, run.stderr);
-  const { rendered, footer } = renderTaskRun({
+  const { rendered: renderedBase, footer } = renderTaskRun({
     summary: run.summary,
     model: run.model,
     jobId: request.jobId ?? null,
@@ -914,7 +1144,8 @@ async function executeTaskRun(request) {
     warnings,
     quota: run.quota,
     maxTurns,
-    exitStatus: run.summary ? null : run.exitStatus
+    exitStatus: run.summary ? null : run.exitStatus,
+    salvaged
   });
 
   const payload = {
@@ -934,27 +1165,31 @@ async function executeTaskRun(request) {
     durationMs: run.summary?.durationMs ?? null,
     quota: run.quota ?? null,
     stopReason: stoppedAtMaxTurns ? "max_turns" : null,
+    salvaged: run.salvaged,
+    ...(salvaged ? { salvageUsage: run.salvageUsage } : {}),
     maxTurns,
     stderr: run.stderr,
     warnings,
     footer
   };
 
-  // --out for background tasks: the worker stores outPath in the request, so
-  // write the result text on completion. Foreground tasks write --out in the
-  // handler (the path is not part of the request there).
-  if (request.outPath) {
-    writeResultOutFile(request.outPath, run.summary && !run.summary.isError ? run.summary.text : "");
+  // --out: the request carries outPath (stored in the job for background
+  // runs). A failed write fails the run.
+  const out = applyOutFile(request.outPath, run, renderedBase);
+  if (out.outError) {
+    payload.status = out.exitStatus;
+    payload.outError = out.outError;
   }
+  const rendered = out.rendered;
 
-  const summary = stoppedAtMaxTurns
+  const summary = stoppedAtMaxTurns && !salvaged
     ? maxTurnsStopMessage(maxTurns, { canContinue: true })
     : run.summary
       ? firstMeaningfulLine(run.summary.text, run.summary.isError ? "NanoGPT run failed." : "Task finished.")
       : noResultError;
 
   return {
-    exitStatus: run.exitStatus,
+    exitStatus: out.exitStatus,
     payload,
     rendered,
     summary,
@@ -1037,7 +1272,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, origin = null) {
   return origin ? { ...job, origin } : job;
 }
 
-function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId, warnings, maxTurns, outPath = null }) {
+function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId, warnings, maxTurns, outPath = null, salvage = true }) {
   return {
     cwd,
     model,
@@ -1048,6 +1283,7 @@ function buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessio
     jobId,
     maxTurns,
     outPath,
+    salvage,
     warnings: Array.isArray(warnings) ? warnings : []
   };
 }
@@ -1123,7 +1359,7 @@ async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "cwd", "max-turns", "focus-file", "out"],
     multiValueOptions: ["exclude"],
-    booleanOptions: ["json", "background", "wait"],
+    booleanOptions: ["json", "background", "wait", "no-salvage"],
     aliasMap: {
       m: "model"
     }
@@ -1188,6 +1424,8 @@ async function handleReviewCommand(argv, config) {
         maxTurns,
         excludes,
         outPath,
+        salvage: !options["no-salvage"],
+        jobId: job.id,
         onProgress: progress
       }),
     { json: options.json }
@@ -1240,7 +1478,7 @@ async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "cwd", "max-turns", "prompt-file", "out"],
     multiValueOptions: ["allow-bash"],
-    booleanOptions: ["json", "continue", "background", "thinking", "wait", "read-only", "allow-paid", "fresh"],
+    booleanOptions: ["json", "continue", "background", "thinking", "wait", "read-only", "allow-paid", "fresh", "no-salvage"],
     aliasMap: {
       m: "model"
     }
@@ -1325,7 +1563,7 @@ async function handleTask(argv) {
   if (options.background) {
     ensureClaudeAvailable(cwd);
     const job = buildTaskJob(workspaceRoot, taskMetadata, profile === "write", origin);
-    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id, warnings, maxTurns, outPath });
+    const request = buildTaskRequest({ cwd, model, prompt, profile, bashAllow, resumeSessionId, jobId: job.id, warnings, maxTurns, outPath, salvage: !options["no-salvage"] });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
@@ -1345,11 +1583,10 @@ async function handleTask(argv) {
         jobId: job.id,
         warnings,
         maxTurns,
+        salvage: !options["no-salvage"],
+        outPath,
         onProgress: progress
       });
-      if (outPath) {
-        writeResultOutFile(outPath, execution.payload.isError ? "" : execution.payload.rawOutput);
-      }
       return execution;
     },
     { json: options.json }
@@ -1419,7 +1656,6 @@ async function handleTaskWorker(argv) {
     () =>
       executeTaskRun({
         ...request,
-        streaming: true,
         onProgress,
         onSession
       }),
@@ -1576,6 +1812,39 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+const DEFAULT_USAGE_DAYS = 7;
+
+function handleUsage(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["days"],
+    booleanOptions: ["json"]
+  });
+
+  let days = DEFAULT_USAGE_DAYS;
+  if (options.days !== undefined) {
+    const raw = String(options.days).trim();
+    if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+      throw new Error(`Invalid --days "${options.days}": expected a positive integer.`);
+    }
+    days = Number(raw);
+  }
+
+  const runLog = resolveRunLogFile(process.env);
+  const mcpLog = path.join(path.dirname(runLog), "mcp-calls.jsonl");
+  const readLines = (file) => {
+    try {
+      return parseJsonl(fs.readFileSync(file, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  const runs = readLines(runLog);
+  const mcp = readLines(mcpLog);
+  const report = buildUsageReport({ runs: runs ?? [], mcp: mcp ?? [], days });
+  report.logs = { runs: runLog, mcp: mcpLog, runsFound: runs !== null, mcpFound: mcp !== null };
+  outputResult(options.json ? report : renderUsageReport(report), options.json);
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -1612,6 +1881,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "usage":
+      handleUsage(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);

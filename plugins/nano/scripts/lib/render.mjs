@@ -14,6 +14,17 @@ export function maxTurnsStopMessage(maxTurns, { canContinue = true } = {}) {
   return `Stopped at the turn limit (${cap} turns) before finishing. ${hint}`;
 }
 
+/**
+ * One-line note that prefixes the body of a run that hit the turn cap and was
+ * then finalized by the no-tools salvage call.
+ */
+export function salvageNote(maxTurns, { isTask = false } = {}) {
+  const cap = typeof maxTurns === "number" ? maxTurns : "?";
+  return isTask
+    ? `Stopped at the turn limit (${cap} turns). Summary of progress so far \u2014 continue with --continue or rerun with a higher --max-turns.`
+    : `Finalized at the turn limit (${cap} turns); some areas may be unchecked.`;
+}
+
 function escapeMarkdownCell(value) {
   return String(value ?? "")
     .replace(/\|/g, "\\|")
@@ -174,7 +185,7 @@ export function buildNoResultError(exitStatus, stderr = "") {
  * (untruncated) result text, and the run footer. When there is no parseable
  * result, falls back to `renderNoResultBody` with no footer.
  */
-export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null, exitStatus = null } = {}) {
+export function renderReviewResult({ reviewLabel, targetLabel, summary, model, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null, exitStatus = null, salvaged = false } = {}) {
   const lines = [`# NanoGPT ${reviewLabel}`, "", `Target: ${targetLabel}`, ""];
 
   if (!summary) {
@@ -183,7 +194,9 @@ export function renderReviewResult({ reviewLabel, targetLabel, summary, model, s
     return `${trimmed}\n`;
   }
 
-  if (isMaxTurnsStop(summary)) {
+  if (salvaged) {
+    lines.push(salvageNote(maxTurns), "", String(summary.text ?? "").trim());
+  } else if (isMaxTurnsStop(summary)) {
     lines.push(maxTurnsStopMessage(maxTurns, { canContinue: false }));
   } else {
     const text = String(summary.text ?? "").trim() || "NanoGPT review completed without any output.";
@@ -204,14 +217,17 @@ export function renderReviewResult({ reviewLabel, targetLabel, summary, model, s
  * Falls back to `renderNoResultBody` (no footer) when there is no parseable
  * result at all.
  */
-export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null, exitStatus = null } = {}) {
+export function renderTaskRun({ summary, model, jobId = null, maxChars, stdout = "", stderr = "", warnings = [], quota = null, maxTurns = null, exitStatus = null, salvaged = false } = {}) {
   if (!summary) {
     return { rendered: renderNoResultBody({ stdout, stderr, exitStatus }), footer: null };
   }
 
   const footer = renderRunFooter({ model, summary, quota });
   let body;
-  if (isMaxTurnsStop(summary)) {
+  if (salvaged) {
+    const { text } = truncateInline(summary.text, { maxChars, jobId });
+    body = `${salvageNote(maxTurns, { isTask: true })}\n\n${text}`;
+  } else if (isMaxTurnsStop(summary)) {
     body = maxTurnsStopMessage(maxTurns, { canContinue: true });
   } else {
     const { text } = truncateInline(summary.text, { maxChars, jobId });
@@ -288,7 +304,8 @@ export function renderStoredJobResult(job, storedJob) {
   if (rawOutput) {
     const isError = Boolean(storedJob?.result?.isError);
     const footer = typeof storedJob?.result?.footer === "string" ? storedJob.result.footer : "";
-    const body = isError ? `NanoGPT run failed:\n\n${rawOutput}` : rawOutput;
+    const salvagedNote = storedJob?.result?.salvaged === true ? `${salvageNote(storedJob.result.maxTurns ?? null, { isTask: true })}\n\n` : "";
+    const body = isError ? `NanoGPT run failed:\n\n${rawOutput}` : `${salvagedNote}${rawOutput}`;
     const withFooter = footer ? `${body}\n\n${footer}` : body;
     return withFooter.endsWith("\n") ? withFooter : `${withFooter}\n`;
   }

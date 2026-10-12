@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the NanoGPT rescue subagent
-argument-hint: "[--background|--wait] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [--prompt-file <path>] [--out <path>] [what NanoGPT should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--continue] [--model <model>] [--thinking] [--read-only] [--allow-bash <prefix>] [--allow-paid] [--max-turns <n>] [--no-salvage] [--prompt-file <path>] [--out <path>] [what NanoGPT should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -20,7 +20,7 @@ Execution mode:
 - `--model` is a runtime-selection flag. Preserve it for the forwarded request, but do not treat it as part of the natural-language task text.
 - `--thinking` is a runtime-selection flag. Preserve it for the forwarded request, but do not treat it as part of the natural-language task text.
 - `--read-only`, `--allow-bash <prefix>` (repeatable), `--allow-paid`, and `--max-turns <n>` are runtime-selection flags. Preserve them for the forwarded request, but do not treat them as part of the natural-language task text.
-- `--max-turns <n>` caps the run at n turns (default 25). Every turn resends the conversation and counts against the NanoGPT weekly quota, cached input included.
+- `--max-turns <n>` caps the run at n turns (default 25). Every turn resends the conversation and counts against the NanoGPT weekly quota, cached input included. If the cap is hit, a final no-tools call summarizes the progress so far; `--no-salvage` skips it.
 - If the request includes `--continue`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting NanoGPT, check for a resumable task from this Claude session by running:
 

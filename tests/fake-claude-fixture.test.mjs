@@ -98,7 +98,7 @@ test("stream-json without --verbose fails", () => {
   assert.equal(readInvocations(invocationsLog).length, 0);
 });
 
-test("stream-json with --verbose emits 5 JSON lines ending with type result", () => {
+test("stream-json with --verbose emits 6 JSON lines ending with type result", () => {
   const binDir = makeTempDir("fake-claude-test-");
   const { scriptPath } = installFakeClaude(binDir);
   const env = buildEnv(binDir);
@@ -109,14 +109,18 @@ test("stream-json with --verbose emits 5 JSON lines ending with type result", ()
   );
   assert.equal(res.status, 0, `stdout=${res.stdout} stderr=${res.stderr}`);
   const lines = res.stdout.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  assert.equal(lines.length, 5);
+  assert.equal(lines.length, 6);
   assert.equal(lines[0].type, "system");
   assert.equal(lines[0].subtype, "init");
   assert.equal(lines[1].type, "assistant");
-  assert.equal(lines[2].type, "user");
-  assert.equal(lines[3].type, "assistant");
-  assert.equal(lines[4].type, "result");
-  assert.equal(lines[4].is_error, false);
+  assert.equal(lines[2].type, "assistant");
+  assert.equal(lines[1].message.id, lines[2].message.id, "one API call is split over two events");
+  assert.equal(lines[3].type, "user");
+  assert.equal(lines[4].type, "assistant");
+  assert.notEqual(lines[4].message.id, lines[1].message.id);
+  assert.equal(typeof lines[4].message.usage.input_tokens, "number");
+  assert.equal(lines[5].type, "result");
+  assert.equal(lines[5].is_error, false);
 });
 
 test("prompt is read from stdin when no -- is given", () => {
