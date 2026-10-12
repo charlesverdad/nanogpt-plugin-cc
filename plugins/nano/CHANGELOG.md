@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Logging MCP proxy (`.mcp.json`, `scripts/nanogpt-mcp-proxy.mjs`) around `@nanogpt/mcp@1.5.0`, exposed as `mcp__plugin_nano_nanogpt__*`. It logs every tool call with latency, usage and cost to `mcp-calls.jsonl`, injects `include_usage` into `nanogpt_chat`, takes the API key from the keychain instead of plaintext config, and raises the upstream timeout to 300 s.
+- Generated and edited images are archived locally with a JSON sidecar holding the original prompt and arguments, and the tool result tells Claude where the files are.
+
 ## 0.1.0
 
 - First release: run tasks and code reviews on NanoGPT subscription models from inside Claude Code. Built on kimi-plugin-cc and following the structure of the official codex-plugin-cc.

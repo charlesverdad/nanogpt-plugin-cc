@@ -326,6 +326,33 @@ In testing (Claude Code 2.1.278, 2026-09-22), auto mode allowed the companion's 
 
 Permission rules match the literal command text, so `${CLAUDE_PLUGIN_ROOT}` can't be used in them. The plugin never tries to bypass the check.
 
+## NanoGPT MCP tools (logged)
+
+The plugin ships an MCP server, `nanogpt`, that wraps NanoGPT's official [`@nanogpt/mcp`](https://www.npmjs.com/package/@nanogpt/mcp) (pinned to 1.5.0, started with `npx`) in a small logging proxy. It starts automatically when the plugin is enabled and exposes the same tools (image generation, chat, balance, and so on) as `mcp__plugin_nano_nanogpt__*`.
+
+What the proxy adds:
+
+- **Call log.** Every tool call is appended to `mcp-calls.jsonl` in the plugin data directory (`$CLAUDE_PLUGIN_DATA`, else the per-user fallback directory under `$TMPDIR`) with latency, model, token usage and cost when the response has them, errors, and a short summary of the arguments. `nanogpt_chat` is called with `include_usage: true` so usage is always reported.
+- **Local image archive.** Images from `nanogpt_image_generate` and `nanogpt_image_edit` are copied to `<media dir>/<YYYY-MM-DD>/<HHMMSS>-<prompt slug>-<hex>.<ext>` (hosted URLs expire, and in-memory images vanish with the server). Each image gets a `.json` sidecar with the full prompt, the call arguments (input images are saved next to it and replaced by a marker), the model, size, hash and source. The tool result gains a `Saved locally: <path>` line so Claude can open or copy the file. The media directory defaults to `$CLAUDE_PLUGIN_DATA/media`.
+- **Key from the keychain.** The API key is read with the same lookup as the rest of the plugin (macOS keychain, `secret-tool`, or `NANOGPT_API_KEY`) and passed to the upstream process only; it is never written to a log or sidecar. With no key the server exits with the keychain setup command.
+- **Longer timeout.** The upstream timeout is raised to 300 s, because GLM chat calls often take over a minute.
+
+Environment variables:
+
+| Variable | Effect |
+| --- | --- |
+| `NANO_MEDIA_DIR` | Where images and sidecars are saved. |
+| `NANOGPT_TIMEOUT_MS` | Upstream request timeout in milliseconds (default `300000`). |
+| `NANO_MCP_UPSTREAM` | JSON array of the command and arguments that start the upstream server, for testing or to change the pinned version. |
+
+The upstream package needs Node 22 or newer. If you previously added `@nanogpt/mcp` yourself (with the key in plaintext in `~/.claude.json`), remove it to avoid duplicate tools and the plaintext key:
+
+```bash
+claude mcp remove nanogpt -s user
+```
+
+You can switch the server off at any time from `/mcp`.
+
 ## Privacy
 
 Headless runs write transcripts to `~/.claude/projects/<cwd-slug>/<session>.jsonl`. These are kept so that `--continue` can resume a previous session. NanoGPT says it does not store prompts by default. Prompts and repository content you send do go to NanoGPT and the model provider.
